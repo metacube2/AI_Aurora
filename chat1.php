@@ -375,6 +375,7 @@ function cleanupOldData() {
 // ═══════════════════════════════════════════════════════════
 
 session_start();
+$isAdminPage = isset($_GET['admin']);
 
 function isLoggedIn() {
     return isset($_SESSION['user_id']) && isset($_SESSION['username']);
@@ -1155,7 +1156,32 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         ]);
         exit;
     }
-    
+
+    if ($action === 'admin_get_banned_users') {
+        $db = getDB();
+
+        $result = $db->query('
+            SELECT id, username, user_id as display_id, ban_reason, last_seen
+            FROM users
+            WHERE is_banned = 1
+            ORDER BY last_seen DESC
+            LIMIT 100
+        ');
+
+        $banned = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $banned[] = [
+                'id' => $row['id'],
+                'display_name' => $row['username'] . '#' . $row['display_id'],
+                'reason' => $row['ban_reason'] ?? 'keine Angabe',
+                'last_seen' => $row['last_seen']
+            ];
+        }
+
+        echo json_encode(['success' => true, 'banned' => $banned]);
+        exit;
+    }
+
     // ───────────────────────────────────────────────────────
     // ADMIN: BAN USER
     // ───────────────────────────────────────────────────────
@@ -1493,7 +1519,254 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             opacity: 0.5;
             cursor: not-allowed;
         }
-        
+
+        /* ═══════════════════════════════════════════════════════════ */
+        /* ADMIN VIEWS */
+        /* ═══════════════════════════════════════════════════════════ */
+
+        .admin-login-container {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 450px;
+        }
+
+        .admin-login-container h1 {
+            text-align: center;
+            font-size: 28px;
+            margin-bottom: 10px;
+            color: #4c51bf;
+        }
+
+        .admin-login-container p {
+            text-align: center;
+            color: #666;
+            margin-bottom: 25px;
+        }
+
+        .admin-login-container .form-group {
+            margin-bottom: 20px;
+        }
+
+        .admin-login-container label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .admin-login-container input {
+            width: 100%;
+            padding: 12px 14px;
+            border-radius: 10px;
+            border: 2px solid #e0e0e0;
+            font-size: 15px;
+            transition: border-color 0.2s ease;
+        }
+
+        .admin-login-container input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .admin-login-container button {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+
+        .admin-login-container button:hover {
+            transform: translateY(-2px);
+        }
+
+        .admin-login-container .back-link {
+            margin-top: 20px;
+            text-align: center;
+        }
+
+        .admin-login-container .back-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .admin-login-container .back-link a:hover {
+            text-decoration: underline;
+        }
+
+        .admin-dashboard {
+            width: 95%;
+            max-width: 1400px;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+
+        .admin-dashboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .admin-dashboard-header h1 {
+            font-size: 26px;
+            color: #4c51bf;
+        }
+
+        .admin-dashboard-header button {
+            padding: 10px 18px;
+            border: none;
+            border-radius: 8px;
+            background: #ef4444;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .admin-dashboard-header button:hover {
+            background: #dc2626;
+        }
+
+        .admin-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+        }
+
+        .admin-stat-card {
+            padding: 20px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            box-shadow: 0 12px 30px rgba(102, 126, 234, 0.35);
+        }
+
+        .admin-stat-card span {
+            font-size: 13px;
+            opacity: 0.85;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .admin-stat-card strong {
+            font-size: 28px;
+        }
+
+        .admin-sections {
+            display: grid;
+            gap: 30px;
+        }
+
+        .admin-section {
+            background: #f9fafb;
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid #e5e7eb;
+        }
+
+        .admin-section h2 {
+            font-size: 18px;
+            margin-bottom: 15px;
+            color: #1f2937;
+        }
+
+        .admin-table-wrapper {
+            overflow-x: auto;
+        }
+
+        .admin-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .admin-table th,
+        .admin-table td {
+            text-align: left;
+            padding: 12px 10px;
+            border-bottom: 1px solid #e5e7eb;
+            vertical-align: top;
+        }
+
+        .admin-table th {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+        }
+
+        .admin-action-buttons {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .admin-action-buttons button {
+            border: none;
+            border-radius: 6px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        .btn-secondary {
+            background: #e5e7eb;
+            color: #111827;
+        }
+
+        .btn-secondary:hover {
+            background: #d1d5db;
+        }
+
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #059669;
+        }
+
+        .admin-empty-state {
+            text-align: center;
+            padding: 20px;
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .admin-error-message {
+            margin-bottom: 15px;
+            color: #dc2626;
+            text-align: center;
+            display: none;
+        }
+
         .error-message {
             background: #fee;
             color: #c33;
@@ -1847,9 +2120,72 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 </head>
 <body>
 
-<?php if (!isLoggedIn()): ?>
+<?php if (isAdmin()): ?>
+    <div class="admin-dashboard">
+        <div class="admin-dashboard-header">
+            <h1>🔐 Admin-Dashboard</h1>
+            <button id="adminLogoutBtn">Logout</button>
+        </div>
+
+        <div class="admin-stats-grid" id="adminStatsGrid">
+            <!-- Stats injected via JS -->
+        </div>
+
+        <div class="admin-sections">
+            <div class="admin-section">
+                <div class="admin-section-header">
+                    <h2>🚨 Offene Meldungen</h2>
+                </div>
+                <div id="adminReportsContainer" class="admin-table-wrapper">
+                    <div class="admin-empty-state">Lade Meldungen…</div>
+                </div>
+            </div>
+
+            <div class="admin-section">
+                <h2>🚩 Markierte Nachrichten</h2>
+                <div id="adminFlaggedContainer" class="admin-table-wrapper">
+                    <div class="admin-empty-state">Lade Nachrichten…</div>
+                </div>
+            </div>
+
+            <div class="admin-section">
+                <h2>🚫 Gesperrte Nutzer</h2>
+                <div id="adminBannedContainer" class="admin-table-wrapper">
+                    <div class="admin-empty-state">Lade Nutzer…</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<?php elseif ($isAdminPage): ?>
+    <div class="admin-login-container">
+        <h1>🔐 Admin-Login</h1>
+        <p>Zugriff nur für autorisierte Moderatoren.</p>
+
+        <div class="admin-error-message" id="adminError"></div>
+
+        <form id="adminLoginForm">
+            <div class="form-group">
+                <label for="adminUsername">Benutzername</label>
+                <input type="text" id="adminUsername" autocomplete="username" required>
+            </div>
+
+            <div class="form-group">
+                <label for="adminPassword">Passwort</label>
+                <input type="password" id="adminPassword" autocomplete="current-password" required>
+            </div>
+
+            <button type="submit">Anmelden</button>
+        </form>
+
+        <div class="back-link">
+            <a href="?">Zurück zum Chat</a>
+        </div>
+    </div>
+
+<?php elseif (!isLoggedIn()): ?>
     <!-- REGISTRATION FORM -->
-    <div class="register-container">
+    <div class="auth-container">
         <h1>💬 Secure Private Chat</h1>
         <p class="subtitle">Sicherer Chat mit Altersverifikation</p>
         
@@ -1943,25 +2279,335 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 // JAVASCRIPT
 // ═══════════════════════════════════════════════════════════
 
-<?php if (!isLoggedIn()): ?>
+<?php if (isAdmin()): ?>
+// ADMIN DASHBOARD
+const adminStatsGrid = document.getElementById('adminStatsGrid');
+const adminReportsContainer = document.getElementById('adminReportsContainer');
+const adminFlaggedContainer = document.getElementById('adminFlaggedContainer');
+const adminBannedContainer = document.getElementById('adminBannedContainer');
+
+function adminEscapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text ?? '';
+    return div.innerHTML;
+}
+
+function adminFormatDate(value) {
+    if (!value) return '-';
+    try {
+        return new Date(value).toLocaleString('de-DE');
+    } catch (e) {
+        return value;
+    }
+}
+
+async function adminFetch(action, payload = {}) {
+    const formData = new FormData();
+    formData.append('action', action);
+    Object.entries(payload).forEach(([key, val]) => formData.append(key, val));
+
+    const response = await fetch('', { method: 'POST', body: formData });
+    return response.json();
+}
+
+function renderAdminStats(stats) {
+    if (!stats) {
+        adminStatsGrid.innerHTML = '<div class="admin-empty-state">Keine Statistiken verfügbar.</div>';
+        return;
+    }
+
+    const statItems = [
+        ['Registrierte Nutzer', stats.total_users],
+        ['U18 Nutzer', stats.u18_users],
+        ['Ü18 Nutzer', stats.o18_users],
+        ['Aktiv online', stats.online_users],
+        ['Nachrichten gesamt', stats.total_messages],
+        ['Markierte Nachrichten', stats.flagged_messages],
+        ['Offene Meldungen', stats.pending_reports],
+        ['Gesperrte Nutzer', stats.banned_users]
+    ];
+
+    adminStatsGrid.innerHTML = statItems.map(([label, value]) => `
+        <div class="admin-stat-card">
+            <span>${adminEscapeHtml(label)}</span>
+            <strong>${Number(value) || 0}</strong>
+        </div>
+    `).join('');
+}
+
+function renderReports(reports) {
+    if (!reports || reports.length === 0) {
+        adminReportsContainer.innerHTML = '<div class="admin-empty-state">Aktuell liegen keine offenen Meldungen vor.</div>';
+        return;
+    }
+
+    const rows = reports.map(report => `
+        <tr data-report-id="${report.id}" data-user-id="${report.reported_user_id}">
+            <td>${adminEscapeHtml(report.reporter)}</td>
+            <td>${adminEscapeHtml(report.reported)}</td>
+            <td>
+                <strong>${adminEscapeHtml(report.reason)}</strong>
+                ${report.message ? `<div>${adminEscapeHtml(report.message)}</div>` : ''}
+            </td>
+            <td>${adminEscapeHtml(adminFormatDate(report.timestamp))}</td>
+            <td>
+                <div class="admin-action-buttons">
+                    <button class="btn-danger" data-action="ban" data-user="${report.reported_user_id}">Sperren</button>
+                    <button class="btn-success" data-action="resolve" data-report="${report.id}">Erledigt</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+
+    adminReportsContainer.innerHTML = `
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Melder</th>
+                    <th>Gemeldeter</th>
+                    <th>Grund &amp; Nachricht</th>
+                    <th>Zeitpunkt</th>
+                    <th>Aktionen</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+
+    adminReportsContainer.querySelectorAll('button[data-action="ban"]').forEach(btn => {
+        btn.addEventListener('click', () => adminBanUser(btn.dataset.user));
+    });
+
+    adminReportsContainer.querySelectorAll('button[data-action="resolve"]').forEach(btn => {
+        btn.addEventListener('click', () => adminResolveReport(btn.dataset.report));
+    });
+}
+
+function renderFlagged(flagged) {
+    if (!flagged || flagged.length === 0) {
+        adminFlaggedContainer.innerHTML = '<div class="admin-empty-state">Keine markierten Nachrichten vorhanden.</div>';
+        return;
+    }
+
+    const rows = flagged.map(item => `
+        <tr data-message-id="${item.id}" data-user-id="${item.user_id}">
+            <td>${adminEscapeHtml(item.user)}</td>
+            <td>${adminEscapeHtml(item.message)}</td>
+            <td>${adminEscapeHtml(item.reason)}</td>
+            <td>${adminEscapeHtml(adminFormatDate(item.timestamp))}</td>
+            <td>
+                <div class="admin-action-buttons">
+                    <button class="btn-danger" data-action="ban" data-user="${item.user_id}">Sperren</button>
+                    <button class="btn-secondary" data-action="delete" data-message="${item.id}">Löschen</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+
+    adminFlaggedContainer.innerHTML = `
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Nutzer</th>
+                    <th>Nachricht</th>
+                    <th>Grund</th>
+                    <th>Zeitpunkt</th>
+                    <th>Aktionen</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+
+    adminFlaggedContainer.querySelectorAll('button[data-action="ban"]').forEach(btn => {
+        btn.addEventListener('click', () => adminBanUser(btn.dataset.user));
+    });
+
+    adminFlaggedContainer.querySelectorAll('button[data-action="delete"]').forEach(btn => {
+        btn.addEventListener('click', () => adminDeleteMessage(btn.dataset.message));
+    });
+}
+
+function renderBanned(banned) {
+    if (!banned || banned.length === 0) {
+        adminBannedContainer.innerHTML = '<div class="admin-empty-state">Keine Nutzer gesperrt.</div>';
+        return;
+    }
+
+    const rows = banned.map(user => `
+        <tr data-user-id="${user.id}">
+            <td>${adminEscapeHtml(user.display_name)}</td>
+            <td>${adminEscapeHtml(user.reason)}</td>
+            <td>${adminEscapeHtml(adminFormatDate(user.last_seen))}</td>
+            <td>
+                <div class="admin-action-buttons">
+                    <button class="btn-success" data-action="unban" data-user="${user.id}">Entsperren</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+
+    adminBannedContainer.innerHTML = `
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Nutzer</th>
+                    <th>Grund</th>
+                    <th>Zuletzt aktiv</th>
+                    <th>Aktionen</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+
+    adminBannedContainer.querySelectorAll('button[data-action="unban"]').forEach(btn => {
+        btn.addEventListener('click', () => adminUnbanUser(btn.dataset.user));
+    });
+}
+
+async function loadAdminStats() {
+    const response = await fetch('?action=admin_get_stats');
+    const result = await response.json();
+    if (result.success) {
+        renderAdminStats(result.stats);
+    }
+}
+
+async function loadAdminReports() {
+    const response = await fetch('?action=admin_get_reports');
+    const result = await response.json();
+    if (result.success) {
+        renderReports(result.reports);
+    }
+}
+
+async function loadAdminFlagged() {
+    const response = await fetch('?action=admin_get_flagged');
+    const result = await response.json();
+    if (result.success) {
+        renderFlagged(result.flagged);
+    }
+}
+
+async function loadAdminBanned() {
+    const result = await fetch('?action=admin_get_banned_users');
+    const data = await result.json();
+    if (data.success) {
+        renderBanned(data.banned);
+    }
+}
+
+async function adminBanUser(userId) {
+    const reason = prompt('Grund für die Sperre eingeben:', 'Verstoß gegen Nutzungsbedingungen');
+    if (reason === null) return;
+
+    const result = await adminFetch('admin_ban_user', { user_id: userId, reason });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function adminResolveReport(reportId) {
+    const actionTaken = prompt('Status für Report festlegen (z.B. resolved, dismissed):', 'resolved');
+    if (actionTaken === null) return;
+
+    const result = await adminFetch('admin_resolve_report', { report_id: reportId, action_taken: actionTaken });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function adminDeleteMessage(messageId) {
+    if (!confirm('Markierte Nachricht wirklich löschen?')) return;
+
+    const result = await adminFetch('admin_delete_message', { message_id: messageId });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function adminUnbanUser(userId) {
+    const result = await adminFetch('admin_unban_user', { user_id: userId });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function refreshAdminData() {
+    await Promise.all([
+        loadAdminStats(),
+        loadAdminReports(),
+        loadAdminFlagged(),
+        loadAdminBanned()
+    ]);
+}
+
+document.getElementById('adminLogoutBtn').addEventListener('click', async () => {
+    await adminFetch('logout');
+    window.location.href = '?';
+});
+
+refreshAdminData();
+setInterval(refreshAdminData, 30000);
+
+<?php elseif ($isAdminPage): ?>
+// ADMIN LOGIN
+const adminLoginForm = document.getElementById('adminLoginForm');
+const adminError = document.getElementById('adminError');
+
+adminLoginForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    adminError.style.display = 'none';
+
+    const formData = new FormData();
+    formData.append('action', 'admin_login');
+    formData.append('username', document.getElementById('adminUsername').value.trim());
+    formData.append('password', document.getElementById('adminPassword').value);
+
+    try {
+        const response = await fetch('', { method: 'POST', body: formData });
+        const result = await response.json();
+
+        if (result.success) {
+            window.location.href = '?admin=1';
+        } else {
+            adminError.textContent = result.error || 'Anmeldung fehlgeschlagen';
+            adminError.style.display = 'block';
+        }
+    } catch (error) {
+        adminError.textContent = 'Server nicht erreichbar';
+        adminError.style.display = 'block';
+    }
+});
+
+<?php elseif (!isLoggedIn()): ?>
 // REGISTRATION
 document.getElementById('registerForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    
+
     const username = document.getElementById('username').value.trim();
     const birthdate = document.getElementById('birthdate').value;
     const agreedTerms = document.getElementById('agreeTerms').checked;
-    
+
     const formData = new FormData();
     formData.append('action', 'register');
     formData.append('username', username);
     formData.append('birthdate', birthdate);
     formData.append('agreed_terms', agreedTerms);
-    
+
     try {
         const response = await fetch('', { method: 'POST', body: formData });
         const result = await response.json();
-        
+
         if (result.success) {
             window.location.reload();
         } else {
@@ -1986,24 +2632,22 @@ const state = {
     eventSource: null
 };
 
-// Load Users
 async function loadUsers() {
     const response = await fetch('?action=get_users');
     const result = await response.json();
-    
+
     if (result.success) {
         state.users = result.users;
         renderUserList();
     }
 }
 
-// Render User List
 function renderUserList() {
     const userList = document.getElementById('userList');
     const searchTerm = document.getElementById('userSearch').value.toLowerCase();
-    
+
     const filtered = state.users.filter(u => u.display_name.toLowerCase().includes(searchTerm));
-    
+
     userList.innerHTML = filtered.map(user => `
         <div class="user-item ${user.id === state.selectedUserId ? 'active' : ''}" onclick="selectUser(${user.id}, '${user.display_name}')">
             <div class="user-avatar">
@@ -2019,46 +2663,43 @@ function renderUserList() {
     `).join('');
 }
 
-// Select User
 function selectUser(userId, displayName) {
     state.selectedUserId = userId;
-    
+
     document.getElementById('chatWelcome').style.display = 'none';
     document.getElementById('chatMessagesContainer').style.display = 'flex';
-    
+
     document.getElementById('chatMessagesHeader').innerHTML = `
         <div class="user-avatar">${displayName.charAt(0).toUpperCase()}</div>
         <div><div class="user-name">${displayName}</div></div>
     `;
-    
+
     loadMessages(userId);
     renderUserList();
 }
 
-// Load Messages
 async function loadMessages(userId) {
     const response = await fetch(`?action=get_messages&user_id=${userId}`);
     const result = await response.json();
-    
+
     if (result.success) {
         state.messages = result.messages;
         renderMessages();
         markAsRead(userId);
-        
+
         if (result.messages.length > 0) {
             state.lastMessageId = Math.max(...result.messages.map(m => m.id));
         }
     }
 }
 
-// Render Messages
 function renderMessages() {
     const container = document.getElementById('chatMessages');
-    
+
     container.innerHTML = state.messages.map(msg => {
         const isSent = msg.from_user_id === state.currentUserId;
         const time = new Date(msg.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-        
+
         return `
             <div class="message ${isSent ? 'message-sent' : 'message-received'}">
                 <div class="message-text">${escapeHtml(msg.message)}</div>
@@ -2066,25 +2707,24 @@ function renderMessages() {
             </div>
         `;
     }).join('');
-    
+
     container.scrollTop = container.scrollHeight;
 }
 
-// Send Message
 async function sendMessage() {
     const input = document.getElementById('chatInput');
     const message = input.value.trim();
-    
+
     if (!message || !state.selectedUserId) return;
-    
+
     const formData = new FormData();
     formData.append('action', 'send_message');
     formData.append('to_user_id', state.selectedUserId);
     formData.append('message', message);
-    
+
     const response = await fetch('', { method: 'POST', body: formData });
     const result = await response.json();
-    
+
     if (result.success) {
         input.value = '';
     } else {
@@ -2092,36 +2732,34 @@ async function sendMessage() {
     }
 }
 
-// Mark as Read
 async function markAsRead(userId) {
     const formData = new FormData();
     formData.append('action', 'mark_read');
     formData.append('user_id', userId);
-    
+
     await fetch('', { method: 'POST', body: formData });
     loadUsers();
 }
 
-// SSE
 function startSSE() {
     state.eventSource = new EventSource(`?stream=events&last_message_id=${state.lastMessageId}`);
-    
+
     state.eventSource.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        
+
         if (data.type === 'messages' && data.messages) {
             data.messages.forEach(msg => {
                 if (msg.id > state.lastMessageId) {
                     state.lastMessageId = msg.id;
-                    
-                    if (state.selectedUserId && 
+
+                    if (state.selectedUserId &&
                         ((msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
                          (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId))) {
-                        
+
                         if (!state.messages.find(m => m.id === msg.id)) {
                             state.messages.push(msg);
                             renderMessages();
-                            
+
                             if (msg.to_user_id === state.currentUserId) {
                                 markAsRead(msg.from_user_id);
                             }
@@ -2129,20 +2767,18 @@ function startSSE() {
                     }
                 }
             });
-            
+
             loadUsers();
         }
     };
 }
 
-// Utility
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
 }
 
-// Event Listeners
 document.getElementById('sendButton').addEventListener('click', sendMessage);
 document.getElementById('chatInput').addEventListener('keypress', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -2158,20 +2794,17 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
     window.location.reload();
 });
 
-// Auto-resize textarea
 document.getElementById('chatInput').addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 100) + 'px';
 });
 
-// Ping every 10s
 setInterval(async () => {
     const formData = new FormData();
     formData.append('action', 'ping');
     await fetch('', { method: 'POST', body: formData });
 }, 10000);
 
-// Init
 loadUsers();
 startSSE();
 setInterval(loadUsers, 30000);
