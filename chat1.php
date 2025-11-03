@@ -1469,23 +1469,10 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             padding: 0;
             box-sizing: border-box;
         }
-
-        :root {
-            --sun-900: #8c5e00;
-            --sun-700: #b77900;
-            --sun-600: #d18c00;
-            --sun-500: #f0b400;
-            --sun-400: #ffd046;
-            --sun-200: #ffe7a3;
-            --sun-100: #fff2c9;
-            --sun-50: #fff8e6;
-            --text-dark: #3c2a00;
-        }
-
+        
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background: radial-gradient(circle at top, var(--sun-400) 0%, var(--sun-700) 45%, var(--sun-900) 100%);
-            color: var(--text-dark);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -1507,14 +1494,14 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .auth-container h1 {
-            color: var(--sun-700);
+            color: #667eea;
             margin-bottom: 10px;
             font-size: 32px;
             text-align: center;
         }
-
+        
         .auth-container .subtitle {
-            color: rgba(60, 42, 0, 0.75);
+            color: #666;
             margin-bottom: 30px;
             text-align: center;
             font-size: 14px;
@@ -1547,27 +1534,26 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         
         .auth-container label {
             display: block;
-            color: var(--text-dark);
+            color: #333;
             font-weight: 600;
             margin-bottom: 8px;
             font-size: 14px;
         }
-
+        
         .auth-container input[type="text"],
         .auth-container input[type="date"],
         .auth-container input[type="password"] {
             width: 100%;
             padding: 12px 15px;
-            border: 2px solid rgba(188, 118, 0, 0.2);
+            border: 2px solid #e0e0e0;
             border-radius: 10px;
             font-size: 15px;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+            transition: border-color 0.3s;
         }
-
+        
         .auth-container input:focus {
             outline: none;
-            border-color: var(--sun-600);
-            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
+            border-color: #667eea;
         }
         
         .auth-container .checkbox-group {
@@ -1606,26 +1592,23 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .auth-container button {
             width: 100%;
             padding: 15px;
-            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             border: none;
-            border-radius: 12px;
+            border-radius: 10px;
             font-size: 16px;
-            font-weight: 600;
+            font-weight: bold;
             cursor: pointer;
-            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            transition: transform 0.2s;
         }
-
+        
         .auth-container button:hover {
             transform: translateY(-2px);
-            box-shadow: 0 16px 28px rgba(188, 118, 0, 0.4);
         }
-
+        
         .auth-container button:disabled {
-            opacity: 0.55;
+            opacity: 0.5;
             cursor: not-allowed;
-            box-shadow: none;
         }
 
         /* ═══════════════════════════════════════════════════════════ */
@@ -1645,7 +1628,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             text-align: center;
             font-size: 28px;
             margin-bottom: 10px;
-            color: var(--sun-700);
+            color: #4c51bf;
         }
 
         .admin-login-container p {
@@ -1669,34 +1652,31 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             width: 100%;
             padding: 12px 14px;
             border-radius: 10px;
-            border: 2px solid rgba(188, 118, 0, 0.2);
+            border: 2px solid #e0e0e0;
             font-size: 15px;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+            transition: border-color 0.2s ease;
         }
 
         .admin-login-container input:focus {
             outline: none;
-            border-color: var(--sun-600);
-            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
+            border-color: #667eea;
         }
 
         .admin-login-container button {
             width: 100%;
             padding: 14px;
             border: none;
-            border-radius: 12px;
-            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
+            border-radius: 10px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             font-size: 16px;
-            font-weight: 600;
+            font-weight: bold;
             cursor: pointer;
-            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            transition: transform 0.2s ease;
         }
 
         .admin-login-container button:hover {
             transform: translateY(-2px);
-            box-shadow: 0 16px 28px rgba(188, 118, 0, 0.4);
         }
 
         .admin-login-container .back-link {
@@ -1705,22 +1685,21 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
 
         .admin-login-container .back-link a {
-            color: var(--sun-700);
+            color: #667eea;
             text-decoration: none;
             font-weight: 600;
         }
 
         .admin-login-container .back-link a:hover {
-            color: var(--sun-900);
             text-decoration: underline;
         }
 
         .admin-dashboard {
             width: 95%;
             max-width: 1400px;
-            background: var(--sun-50);
+            background: white;
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(60, 42, 0, 0.25);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             padding: 30px;
             display: flex;
             flex-direction: column;
@@ -1736,7 +1715,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 
         .admin-dashboard-header h1 {
             font-size: 26px;
-            color: var(--sun-700);
+            color: #4c51bf;
         }
 
         .admin-dashboard-header button {
@@ -1762,12 +1741,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .admin-stat-card {
             padding: 20px;
             border-radius: 16px;
-            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             display: flex;
             flex-direction: column;
             gap: 6px;
-            box-shadow: 0 12px 30px rgba(188, 118, 0, 0.35);
+            box-shadow: 0 12px 30px rgba(102, 126, 234, 0.35);
         }
 
         .admin-stat-card span {
@@ -1787,10 +1766,10 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
 
         .admin-section {
-            background: rgba(255,255,255,0.9);
+            background: #f9fafb;
             border-radius: 16px;
             padding: 20px;
-            border: 1px solid rgba(188, 118, 0, 0.18);
+            border: 1px solid #e5e7eb;
         }
 
         .admin-section h2 {
@@ -2175,11 +2154,11 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             height: 100%;
             background: rgba(255,255,255,0.6);
         }
-
+        
         .chat-messages-header {
-            background: rgba(255,255,255,0.94);
-            padding: 18px 24px;
-            border-bottom: 1px solid rgba(188, 118, 0, 0.18);
+            background: white;
+            padding: 15px 20px;
+            border-bottom: 1px solid #e0e0e0;
             display: flex;
             align-items: center;
             gap: 12px;
@@ -2834,123 +2813,57 @@ async function loadUsers() {
 
 function renderUserList() {
     const userList = document.getElementById('userList');
-    if (!userList) {
-        return;
-    }
+    const searchTerm = document.getElementById('userSearch').value.toLowerCase();
 
-    const searchInput = document.getElementById('userSearch');
-    const searchTerm = (searchInput?.value || '').toLowerCase();
+    const filtered = state.users.filter(u => u.display_name.toLowerCase().includes(searchTerm));
 
-    const filtered = state.users.filter(u => (u.display_name || '').toLowerCase().includes(searchTerm));
-
-    if (filtered.length === 0) {
-        userList.innerHTML = '<div class="empty-user-list">Keine Nutzer gefunden.</div>';
-        return;
-    }
-
-    userList.innerHTML = filtered.map(user => {
-        const displayNameRaw = (user.display_name || user.username || '').trim();
-        const displayName = displayNameRaw.length > 0 ? displayNameRaw : 'Unbekannt';
-        const initial = displayName.charAt(0).toUpperCase() || '?';
-
-        return `
-            <button type="button" class="user-item ${user.id === state.selectedUserId ? 'active' : ''}" data-user-id="${user.id}">
-                <div class="user-avatar">
-                    ${escapeHtml(initial)}
-                    <div class="online-indicator ${user.is_online ? '' : 'offline-indicator'}"></div>
-                </div>
-                <div class="user-info-text">
-                    <div class="user-name">${escapeHtml(displayName)}</div>
-                    <div class="user-status">${user.is_online ? 'Online' : 'Offline'}</div>
-                </div>
-                ${user.unread_count > 0 ? `<div class="unread-badge">${user.unread_count}</div>` : ''}
-            </button>
-        `;
-    }).join('');
-
-    userList.querySelectorAll('.user-item').forEach(item => {
-        item.addEventListener('click', () => {
-            const userId = Number(item.dataset.userId);
-            const user = state.users.find(u => u.id === userId);
-            if (!user) {
-                return;
-            }
-            selectUser(user.id, user.display_name || user.username);
-        });
-    });
+    userList.innerHTML = filtered.map(user => `
+        <div class="user-item ${user.id === state.selectedUserId ? 'active' : ''}" onclick="selectUser(${user.id}, '${user.display_name}')">
+            <div class="user-avatar">
+                ${user.username.charAt(0).toUpperCase()}
+                <div class="online-indicator ${user.is_online ? '' : 'offline-indicator'}"></div>
+            </div>
+            <div class="user-info-text">
+                <div class="user-name">${user.display_name}</div>
+                <div class="user-status">${user.is_online ? 'Online' : 'Offline'}</div>
+            </div>
+            ${user.unread_count > 0 ? `<div class="unread-badge">${user.unread_count}</div>` : ''}
+        </div>
+    `).join('');
 }
 
 function selectUser(userId, displayName) {
     state.selectedUserId = userId;
 
-    const welcome = document.getElementById('chatWelcome');
-    if (welcome) {
-        welcome.style.display = 'none';
-    }
+    document.getElementById('chatWelcome').style.display = 'none';
+    document.getElementById('chatMessagesContainer').style.display = 'flex';
 
-    const container = document.getElementById('chatMessagesContainer');
-    if (container) {
-        container.style.display = 'flex';
-    }
-
-    const safeDisplayName = (displayName || '').trim() || 'Unbekannt';
-    const initial = safeDisplayName.charAt(0).toUpperCase() || '?';
-
-    const header = document.getElementById('chatMessagesHeader');
-    if (header) {
-        header.innerHTML = `
-            <div class="user-avatar">${escapeHtml(initial)}</div>
-            <div><div class="user-name">${escapeHtml(safeDisplayName)}</div></div>
-        `;
-    }
-
-    const messageList = document.getElementById('chatMessages');
-    if (messageList) {
-        messageList.innerHTML = '<div class="loading-state">Nachrichten werden geladen…</div>';
-    }
+    document.getElementById('chatMessagesHeader').innerHTML = `
+        <div class="user-avatar">${displayName.charAt(0).toUpperCase()}</div>
+        <div><div class="user-name">${displayName}</div></div>
+    `;
 
     loadMessages(userId);
     renderUserList();
 }
 
 async function loadMessages(userId) {
-    const messageList = document.getElementById('chatMessages');
+    const response = await fetch(`?action=get_messages&user_id=${userId}`);
+    const result = await response.json();
 
-    try {
-        const response = await fetch(`?action=get_messages&user_id=${userId}`);
-        const result = await response.json();
+    if (result.success) {
+        state.messages = result.messages;
+        renderMessages();
+        markAsRead(userId);
 
-        if (result.success) {
-            state.messages = result.messages;
-            renderMessages();
-            markAsRead(userId);
-
-            if (result.messages.length > 0) {
-                state.lastMessageId = Math.max(...result.messages.map(m => m.id));
-            }
-        } else if (messageList) {
-            state.messages = [];
-            messageList.innerHTML = `<div class="error-state">${escapeHtml(result.error || 'Nachrichten konnten nicht geladen werden.')}</div>`;
-        }
-    } catch (error) {
-        if (messageList) {
-            state.messages = [];
-            messageList.innerHTML = '<div class="error-state">Verbindung fehlgeschlagen. Bitte versuche es erneut.</div>';
+        if (result.messages.length > 0) {
+            state.lastMessageId = Math.max(...result.messages.map(m => m.id));
         }
     }
 }
 
 function renderMessages() {
     const container = document.getElementById('chatMessages');
-
-    if (!container) {
-        return;
-    }
-
-    if (!state.messages || state.messages.length === 0) {
-        container.innerHTML = '<div class="empty-messages">Noch keine Nachrichten. Starte den Chat!</div>';
-        return;
-    }
 
     container.innerHTML = state.messages.map(msg => {
         const isSent = msg.from_user_id === state.currentUserId;
