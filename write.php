@@ -30,8 +30,6 @@ define('LOG_RETENTION_MONTHS', 6);
 define('ONLINE_TIMEOUT_SECONDS', 30);
 define('SSE_RETRY_MS', 500);
 define('MAX_MESSAGES_PER_FETCH', 200);
-define('MAX_ATTACHMENT_SIZE', 200 * 1024); // 200 KB
-define('UPLOAD_DIR', __DIR__ . '/uploads');
 
 // Rate Limiting
 define('MAX_MESSAGES_PER_MINUTE', 10);
@@ -73,152 +71,129 @@ $PROFANITY_FILTER = [
 // ═══════════════════════════════════════════════════════════
 
 function getDB() {
-    static $db = null;
-    static $initialized = false;
+    $db = new SQLite3(DB_FILE);
+    $db->busyTimeout(5000);
+    
+    // Users Table (mit Geburtsdatum und User-ID)
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            user_id TEXT UNIQUE NOT NULL,
+            birthdate DATE NOT NULL,
+            age_group TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            is_banned INTEGER DEFAULT 0,
+            ban_reason TEXT
+        )
+    ');
+    
+    // Messages Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_user_id INTEGER NOT NULL,
+            to_user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            is_read INTEGER DEFAULT 0,
+            is_flagged INTEGER DEFAULT 0,
+            flag_reason TEXT,
+            FOREIGN KEY (from_user_id) REFERENCES users(id),
+            FOREIGN KEY (to_user_id) REFERENCES users(id)
+        )
+    ');
+    
+    // Online Status Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS online_status (
+            user_id INTEGER PRIMARY KEY,
+            last_ping DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ');
 
-    if ($db === null) {
-        if (!is_dir(UPLOAD_DIR)) {
-            @mkdir(UPLOAD_DIR, 0755, true);
-        }
+    // User Sessions Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            user_id INTEGER PRIMARY KEY,
+            session_token TEXT NOT NULL,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ');
 
-        $db = new SQLite3(DB_FILE);
-        $db->busyTimeout(5000);
-    }
-
-    if (!$initialized) {
-        // Users Table (mit Geburtsdatum und User-ID)
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL,
-                user_id TEXT UNIQUE NOT NULL,
-                birthdate DATE NOT NULL,
-                age_group TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-                is_banned INTEGER DEFAULT 0,
-                ban_reason TEXT
-            )
-        ');
-
-        // Messages Table
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                from_user_id INTEGER NOT NULL,
-                to_user_id INTEGER NOT NULL,
-                message TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                is_read INTEGER DEFAULT 0,
-                is_flagged INTEGER DEFAULT 0,
-                flag_reason TEXT,
-                attachment_path TEXT,
-                attachment_type TEXT,
-                attachment_size INTEGER,
-                FOREIGN KEY (from_user_id) REFERENCES users(id),
-                FOREIGN KEY (to_user_id) REFERENCES users(id)
-            )
-        ');
-
-        // Ensure attachment columns exist for older installations
-        $messagesInfo = $db->query('PRAGMA table_info(messages)');
-        $messageColumns = [];
-        while ($column = $messagesInfo->fetchArray(SQLITE3_ASSOC)) {
-            $messageColumns[$column['name']] = true;
-        }
-        if (!isset($messageColumns['attachment_path'])) {
-            $db->exec('ALTER TABLE messages ADD COLUMN attachment_path TEXT');
-        }
-        if (!isset($messageColumns['attachment_type'])) {
-            $db->exec('ALTER TABLE messages ADD COLUMN attachment_type TEXT');
-        }
-        if (!isset($messageColumns['attachment_size'])) {
-            $db->exec('ALTER TABLE messages ADD COLUMN attachment_size INTEGER');
-        }
-
-        // Online Status Table
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS online_status (
-                user_id INTEGER PRIMARY KEY,
-                last_ping DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        ');
-
-        // User Sessions Table
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS user_sessions (
-                user_id INTEGER PRIMARY KEY,
-                session_token TEXT NOT NULL,
-                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        ');
-
-        // Reports Table
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                reporter_id INTEGER NOT NULL,
-                reported_user_id INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                message_id INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT "pending",
-                FOREIGN KEY (reporter_id) REFERENCES users(id),
-                FOREIGN KEY (reported_user_id) REFERENCES users(id),
-                FOREIGN KEY (message_id) REFERENCES messages(id)
-            )
-        ');
-
-        // Blocks Table
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS blocks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                blocker_id INTEGER NOT NULL,
-                blocked_id INTEGER NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (blocker_id) REFERENCES users(id),
-                FOREIGN KEY (blocked_id) REFERENCES users(id),
-                UNIQUE(blocker_id, blocked_id)
-            )
-        ');
-
-        // Rate Limiting Table
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS rate_limits (
-                user_id INTEGER NOT NULL,
-                action_type TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        ');
-
-        // Logs Table (für Behörden)
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS security_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                action TEXT NOT NULL,
-                details TEXT,
-                ip_address TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        ');
-
-        // Admin Table
-        $db->exec('
-            CREATE TABLE IF NOT EXISTS admins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ');
-
-        // Create default admin if not exists
-        $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
+    // Reports Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reporter_id INTEGER NOT NULL,
+            reported_user_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            message_id INTEGER,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT "pending",
+            FOREIGN KEY (reporter_id) REFERENCES users(id),
+            FOREIGN KEY (reported_user_id) REFERENCES users(id),
+            FOREIGN KEY (message_id) REFERENCES messages(id)
+        )
+    ');
+    
+    // Blocks Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            blocker_id INTEGER NOT NULL,
+            blocked_id INTEGER NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (blocker_id) REFERENCES users(id),
+            FOREIGN KEY (blocked_id) REFERENCES users(id),
+            UNIQUE(blocker_id, blocked_id)
+        )
+    ');
+    
+    // Rate Limiting Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            user_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ');
+    
+    // Logs Table (für Behörden)
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS security_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT NOT NULL,
+            details TEXT,
+            ip_address TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ');
+    
+    // Admin Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ');
+    
+    // Create default admin if not exists
+    $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
+    $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+    $result = $stmt->execute();
+    $row = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if ($row['count'] == 0) {
+        $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
         $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
         $result = $stmt->execute();
         $row = $result->fetchArray(SQLITE3_ASSOC);
@@ -240,6 +215,14 @@ function getDB() {
 
         $initialized = true;
     }
+    
+    // Create indexes
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user_id, to_user_id)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen)');
 
     return $db;
 }
@@ -921,9 +904,6 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
                     m.timestamp,
                     m.is_read,
                     m.is_flagged,
-                    m.attachment_path,
-                    m.attachment_type,
-                    m.attachment_size,
                     u.username as from_username,
                     u.user_id as from_display_id
                 FROM messages m
@@ -1791,7 +1771,6 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
             background: linear-gradient(135deg, #fef08a 0%, #f97316 100%);
-            background-color: #fff9db;
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -3243,14 +3222,6 @@ const chatStateMessageEl = document.getElementById('chatStateMessage');
 const chatMessagesHeaderEl = document.getElementById('chatMessagesHeader');
 const chatInputEl = document.getElementById('chatInput');
 const sendButtonEl = document.getElementById('sendButton');
-const attachmentButtonEl = document.getElementById('attachmentButton');
-const attachmentInputEl = document.getElementById('attachmentInput');
-const attachmentInfoEl = document.getElementById('attachmentInfo');
-const attachmentFileNameEl = document.getElementById('attachmentFileName');
-const attachmentClearBtnEl = document.getElementById('attachmentClearBtn');
-const attachmentWarningEl = document.getElementById('attachmentWarning');
-const ATTACHMENT_MAX_SIZE = 200 * 1024;
-let messageAbortController = null;
 
 async function loadUsers() {
     if (!userListEl) {
@@ -3310,23 +3281,9 @@ function renderUserList() {
         return;
     }
 
-    const offlineLimit = 5;
-    const onlineUsers = [];
-    const offlineUsers = [];
-
-    filtered.forEach(user => {
-        if (user.is_online) {
-            onlineUsers.push(user);
-        } else {
-            offlineUsers.push(user);
-        }
-    });
-
-    const limitedUsers = onlineUsers.concat(offlineUsers.slice(0, offlineLimit));
-
     const fragment = document.createDocumentFragment();
 
-    limitedUsers.forEach(user => {
+    filtered.forEach(user => {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = 'user-item' + (Number(user.id) === Number(state.selectedUserId) ? ' active' : '');
@@ -3374,15 +3331,6 @@ function renderUserList() {
 
     userListEl.innerHTML = '';
     userListEl.appendChild(fragment);
-
-    if (offlineUsers.length > offlineLimit) {
-        const hint = document.createElement('div');
-        hint.className = 'user-status';
-        hint.style.textAlign = 'center';
-        hint.style.marginTop = '12px';
-        hint.textContent = 'Weitere Offline-Nutzer werden ausgeblendet.';
-        userListEl.appendChild(hint);
-    }
 }
 
 function renderChatHeader(displayName) {
@@ -3440,9 +3388,6 @@ function selectUser(userId, displayName) {
     state.selectedUserId = userId;
     state.messages = [];
 
-    clearAttachmentSelection();
-    clearAttachmentWarning();
-
     if (chatWelcomeEl) {
         chatWelcomeEl.style.display = 'none';
     }
@@ -3467,18 +3412,11 @@ async function loadMessages(userId) {
         return;
     }
 
-    if (messageAbortController) {
-        messageAbortController.abort();
-    }
-
-    const currentController = new AbortController();
-    messageAbortController = currentController;
-
     state.isLoadingMessages = true;
     updateChatState('loading', 'Nachrichten werden geladen…');
 
     try {
-        const response = await fetch(`?action=get_messages&user_id=${userId}`, { signal: currentController.signal });
+        const response = await fetch(`?action=get_messages&user_id=${userId}`);
         if (!response.ok) {
             throw new Error('NETZWERK_FEHLER');
         }
@@ -3503,9 +3441,6 @@ async function loadMessages(userId) {
             updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
         }
     } catch (error) {
-        if (error && error.name === 'AbortError') {
-            return;
-        }
         console.error('Nachrichten konnten nicht geladen werden:', error);
         state.messages = [];
         if (chatMessagesEl) {
@@ -3516,10 +3451,7 @@ async function loadMessages(userId) {
             : 'Nachrichten konnten nicht geladen werden. Bitte versuche es erneut.';
         updateChatState('error', errorMessage);
     } finally {
-        if (messageAbortController === currentController) {
-            messageAbortController = null;
-            state.isLoadingMessages = false;
-        }
+        state.isLoadingMessages = false;
     }
 }
 
@@ -3560,51 +3492,12 @@ function renderMessages() {
     updateChatState(null);
 }
 
-function clearAttachmentSelection() {
-    if (attachmentInputEl) {
-        attachmentInputEl.value = '';
-    }
-    if (attachmentInfoEl) {
-        attachmentInfoEl.classList.add('hidden');
-    }
-    if (attachmentFileNameEl) {
-        attachmentFileNameEl.textContent = '';
-    }
-}
-
-function showAttachmentWarning(message) {
-    if (attachmentWarningEl) {
-        attachmentWarningEl.textContent = message;
-        attachmentWarningEl.classList.remove('hidden');
-    } else {
-        alert(message);
-    }
-}
-
-function clearAttachmentWarning() {
-    if (attachmentWarningEl) {
-        attachmentWarningEl.textContent = '';
-        attachmentWarningEl.classList.add('hidden');
-    }
-}
-
 async function sendMessage() {
     if (!chatInputEl) {
         return;
     }
 
-    if (!state.selectedUserId) {
-        showAttachmentWarning('Bitte wähle zuerst einen Chat aus.');
-        return;
-    }
-
     const message = chatInputEl.value.trim();
-    const attachmentFile = attachmentInputEl?.files?.[0] || null;
-
-    if (!message && !attachmentFile) {
-        showAttachmentWarning('Bitte gib eine Nachricht ein oder hänge ein JPG-Bild an.');
-        return;
-    }
 
     clearAttachmentWarning();
 
@@ -3635,21 +3528,11 @@ async function sendMessage() {
         formData.append('attachment', attachmentFile);
     }
 
-    try {
-        const response = await fetch('', { method: 'POST', body: formData });
-        const result = await response.json();
-
-        if (result.success) {
-            chatInputEl.value = '';
-            chatInputEl.dispatchEvent(new Event('input'));
-            clearAttachmentSelection();
-            clearAttachmentWarning();
-        } else {
-            showAttachmentWarning(result.error || 'Nachricht konnte nicht gesendet werden.');
-        }
-    } catch (error) {
-        console.error('Nachricht konnte nicht gesendet werden:', error);
-        showAttachmentWarning('Nachricht konnte nicht gesendet werden.');
+    if (result.success) {
+        chatInputEl.value = '';
+        chatInputEl.dispatchEvent(new Event('input'));
+    } else {
+        alert(result.error);
     }
 }
 
@@ -3732,7 +3615,7 @@ function startSSE() {
             state.eventSource.close();
         }
 
-        setTimeout(startSSE, 500);
+        setTimeout(startSSE, 1500);
     };
 }
 
@@ -3741,56 +3624,6 @@ function escapeHtml(text) {
     div.textContent = text ?? '';
     return div.innerHTML;
 }
-
-function escapeAttribute(value) {
-    const div = document.createElement('div');
-    div.textContent = value ?? '';
-    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-attachmentButtonEl?.addEventListener('click', () => {
-    attachmentInputEl?.click();
-});
-
-attachmentInputEl?.addEventListener('change', () => {
-    clearAttachmentWarning();
-
-    if (!attachmentInputEl.files || attachmentInputEl.files.length === 0) {
-        clearAttachmentSelection();
-        return;
-    }
-
-    const file = attachmentInputEl.files[0];
-    const fileType = (file.type || '').toLowerCase();
-    const fileName = file.name || '';
-    const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
-
-    if (!isJpeg) {
-        showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
-        clearAttachmentSelection();
-        return;
-    }
-
-    if (file.size > ATTACHMENT_MAX_SIZE) {
-        showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
-        clearAttachmentSelection();
-        return;
-    }
-
-    if (attachmentInfoEl) {
-        attachmentInfoEl.classList.remove('hidden');
-    }
-
-    if (attachmentFileNameEl) {
-        const sizeKb = Math.max(1, Math.round(file.size / 1024));
-        attachmentFileNameEl.textContent = `${file.name} (${sizeKb} KB)`;
-    }
-});
-
-attachmentClearBtnEl?.addEventListener('click', () => {
-    clearAttachmentSelection();
-    clearAttachmentWarning();
-});
 
 sendButtonEl?.addEventListener('click', sendMessage);
 
