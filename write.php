@@ -603,7 +603,7 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $username = trim($_POST['username'] ?? '');
         $birthdate = trim($_POST['birthdate'] ?? '');
         $agreed_terms = isset($_POST['agreed_terms']) && $_POST['agreed_terms'] === 'true';
-        
+
         // Validierung
         if (empty($username) || empty($birthdate)) {
             echo json_encode(['success' => false, 'error' => 'Username und Geburtsdatum erforderlich']);
@@ -700,7 +700,85 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         ]);
         exit;
     }
-    
+
+    // ───────────────────────────────────────────────────────
+    // LOGIN
+    // ───────────────────────────────────────────────────────
+    if ($action === 'login') {
+        $username = trim($_POST['username'] ?? '');
+        $birthdate = trim($_POST['birthdate'] ?? '');
+        $forceLogin = in_array(($_POST['force_login'] ?? '0'), ['1', 'true', 'TRUE'], true);
+
+        if ($username === '' || $birthdate === '') {
+            echo json_encode(['success' => false, 'error' => 'Bitte gib Username und Geburtsdatum ein.']);
+            exit;
+        }
+
+        $db = getDB();
+        $stmt = $db->prepare('
+            SELECT id, username, user_id as display_id, birthdate, age_group, is_banned, ban_reason
+            FROM users
+            WHERE LOWER(username) = LOWER(:username)
+            LIMIT 1
+        ');
+        $stmt->bindValue(':username', $username, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $user = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$user) {
+            echo json_encode(['success' => false, 'error' => 'Account wurde nicht gefunden.']);
+            exit;
+        }
+
+        if ((int)$user['is_banned'] === 1) {
+            $reason = $user['ban_reason'] ? (string)$user['ban_reason'] : 'Verstoß gegen Regeln';
+            echo json_encode(['success' => false, 'error' => 'Dein Account ist gesperrt: ' . $reason]);
+            exit;
+        }
+
+        if ($user['birthdate'] !== $birthdate) {
+            logSecurityEvent($user['id'], 'LOGIN_FAILED', 'Falsches Geburtsdatum');
+            echo json_encode(['success' => false, 'error' => 'Daten stimmen nicht überein.']);
+            exit;
+        }
+
+        $sessionResult = startUserSession($user['id'], $forceLogin);
+        if (!$sessionResult['allowed']) {
+            $response = [
+                'success' => false,
+                'error' => $sessionResult['error'] ?? 'Anmeldung nicht möglich.'
+            ];
+
+            if (!empty($sessionResult['can_force'])) {
+                $response['can_force'] = true;
+            }
+
+            echo json_encode($response);
+            exit;
+        }
+
+        if ($forceLogin) {
+            logSecurityEvent($user['id'], 'LOGIN_FORCE', 'Sitzung übernommen');
+        }
+
+        $_SESSION['user_id'] = $user['id'];
+        $_SESSION['username'] = $user['username'];
+        $_SESSION['user_display_id'] = $user['display_id'];
+        $_SESSION['age_group'] = $user['age_group'];
+        $_SESSION['birthdate'] = $user['birthdate'];
+
+        updateOnlineStatus($user['id']);
+        logSecurityEvent($user['id'], 'LOGIN', 'Erfolgreiche Anmeldung');
+
+        echo json_encode([
+            'success' => true,
+            'user_id' => $user['id'],
+            'display_name' => $user['username'] . '#' . $user['display_id'],
+            'age_group' => $user['age_group']
+        ]);
+        exit;
+    }
+
     // ───────────────────────────────────────────────────────
     // ADMIN LOGIN
     // ───────────────────────────────────────────────────────
@@ -1614,23 +1692,106 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'admin_delete_message') {
         $messageId = intval($_POST['message_id'] ?? 0);
-        
+
         if ($messageId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige Message-ID']);
             exit;
         }
-        
+
         $db = getDB();
         $stmt = $db->prepare('DELETE FROM messages WHERE id = :message_id');
         $stmt->bindValue(':message_id', $messageId, SQLITE3_INTEGER);
         $stmt->execute();
-        
+
         logSecurityEvent(null, 'ADMIN_DELETE_MESSAGE', "Message ID: $messageId");
-        
+
         echo json_encode(['success' => true, 'message' => 'Nachricht wurde gelöscht']);
         exit;
     }
-    
+
+    if ($action === 'poll_updates') {
+        if (!isLoggedIn()) {
+            echo json_encode(['success' => false, 'error' => 'Nicht angemeldet']);
+            exit;
+        }
+
+        if (!validateActiveSession()) {
+            echo json_encode(['success' => false, 'error' => 'Sitzung ungültig']);
+            exit;
+        }
+
+        $lastMessageId = intval($_POST['last_message_id'] ?? $_GET['last_message_id'] ?? 0);
+
+        $db = getDB();
+        $currentUserId = getCurrentUserId();
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        touchUserSession($currentUserId);
+
+        $stmt = $db->prepare('
+            SELECT
+                m.id,
+                m.from_user_id,
+                m.to_user_id,
+                m.message,
+                m.timestamp,
+                m.attachment_path,
+                m.attachment_type,
+                m.attachment_size,
+                uf.username as from_username,
+                uf.user_id as from_display_id,
+                uf.age_group as from_age_group,
+                ut.age_group as to_age_group
+            FROM messages m
+            JOIN users uf ON m.from_user_id = uf.id
+            JOIN users ut ON m.to_user_id = ut.id
+            WHERE m.id > :last_message_id
+            AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
+            AND NOT EXISTS (
+                SELECT 1 FROM blocks
+                WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
+                OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
+            )
+            ORDER BY m.id ASC
+        ');
+        $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
+        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+
+        $messages = [];
+        $maxId = $lastMessageId;
+
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+            if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+                continue;
+            }
+
+            $maxId = max($maxId, (int)$row['id']);
+
+            $messages[] = [
+                'id' => $row['id'],
+                'from_user_id' => $row['from_user_id'],
+                'to_user_id' => $row['to_user_id'],
+                'message' => $row['message'],
+                'timestamp' => $row['timestamp'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
+                'from_username' => $row['from_username'],
+                'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
+            ];
+        }
+
+        echo json_encode([
+            'success' => true,
+            'messages' => $messages,
+            'last_message_id' => $maxId
+        ]);
+        exit;
+    }
+
     echo json_encode(['success' => false, 'error' => 'Unbekannte Aktion']);
     exit;
 }
@@ -2176,7 +2337,70 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             display: none;
             font-size: 14px;
         }
-        
+
+        .auth-toggle {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 18px;
+            background: rgba(255, 221, 87, 0.2);
+            padding: 6px;
+            border-radius: 999px;
+        }
+
+        .auth-toggle button {
+            flex: 1;
+            border: none;
+            border-radius: 999px;
+            padding: 10px 12px;
+            font-weight: 600;
+            cursor: pointer;
+            background: transparent;
+            color: #92400e;
+            transition: background 0.2s ease, color 0.2s ease;
+        }
+
+        .auth-toggle button.active {
+            background: linear-gradient(135deg, var(--sun-400), var(--sun-500));
+            color: #ffffff;
+            box-shadow: 0 8px 16px rgba(188, 118, 0, 0.25);
+        }
+
+        .auth-form.hidden {
+            display: none;
+        }
+
+        .form-helper {
+            font-size: 13px;
+            color: #92400e;
+            margin-top: -8px;
+            margin-bottom: 16px;
+        }
+
+        .force-login-box {
+            background: #fff7ed;
+            border: 1px solid rgba(217, 119, 6, 0.25);
+            border-radius: 12px;
+            padding: 12px;
+            margin-bottom: 16px;
+            display: none;
+        }
+
+        .force-login-box p {
+            margin: 0 0 12px;
+            font-size: 13px;
+            color: #92400e;
+        }
+
+        .force-login-box button {
+            background: var(--sun-500);
+            color: #fff;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 10px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
         .success-message {
             background: #d4edda;
             color: #155724;
@@ -2756,20 +2980,26 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     <div class="auth-container">
         <h1>💬 Secure Private Chat</h1>
         <p class="subtitle">Sicherer Chat mit Altersverifikation</p>
-        
-        <div class="error-message" id="errorMessage"></div>
-        
-        <form id="registerForm">
+
+        <div class="auth-toggle">
+            <button type="button" class="auth-toggle-button active" data-target="register">Registrieren</button>
+            <button type="button" class="auth-toggle-button" data-target="login">Einloggen</button>
+        </div>
+
+        <div class="error-message" id="registerError"></div>
+        <div class="error-message" id="loginError"></div>
+
+        <form id="registerForm" class="auth-form">
             <div class="form-group">
                 <label>Username (3-15 Zeichen)</label>
                 <input type="text" id="username" maxlength="15" required>
             </div>
-            
+
             <div class="form-group">
                 <label>Geburtsdatum</label>
                 <input type="date" id="birthdate" required>
             </div>
-            
+
             <div class="terms-box">
                 <h3>⚠️ Wichtige Regeln</h3>
                 <ul>
@@ -2785,10 +3015,31 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                 <input type="checkbox" id="agreeTerms" required>
                 <label for="agreeTerms">Ich akzeptiere die Nutzungsbedingungen</label>
             </div>
-            
+
             <button type="submit" class="btn-primary">Chat beitreten</button>
         </form>
-        
+
+        <form id="loginForm" class="auth-form hidden">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="loginUsername" maxlength="15" autocomplete="username" required>
+            </div>
+
+            <div class="form-group">
+                <label>Geburtsdatum</label>
+                <input type="date" id="loginBirthdate" autocomplete="bday" required>
+            </div>
+
+            <p class="form-helper">Nutze dein registriertes Geburtsdatum zur Bestätigung deiner Identität.</p>
+
+            <div class="force-login-box" id="loginTakeoverBox">
+                <p>Deine vorige Sitzung scheint noch aktiv zu sein. Du kannst sie hier übernehmen, falls du sicher bist, dass du ausgeloggt bist.</p>
+                <button type="button" id="loginTakeoverBtn">Sitzung übernehmen</button>
+            </div>
+
+            <button type="submit" class="btn-primary">Einloggen</button>
+        </form>
+
         <div class="admin-link">
             <a href="?admin=1">Admin-Login</a>
         </div>
@@ -2857,6 +3108,37 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 // JAVASCRIPT
 // ═══════════════════════════════════════════════════════════
 
+const currentUrl = new URL(window.location.href);
+const basePath = currentUrl.pathname;
+const baseParams = new URLSearchParams(currentUrl.search);
+const postTarget = `${currentUrl.origin}${basePath}${baseParams.toString() ? `?${baseParams.toString()}` : ''}`;
+
+function buildUrl(params = {}) {
+    const url = new URL(basePath, window.location.origin);
+    baseParams.forEach((value, key) => {
+        if (!Object.prototype.hasOwnProperty.call(params, key)) {
+            url.searchParams.set(key, value);
+        }
+    });
+
+    Object.entries(params).forEach(([key, value]) => {
+        if (value === null || value === undefined) {
+            return;
+        }
+        url.searchParams.set(key, value);
+    });
+
+    return url.toString();
+}
+
+function postFormData(formData) {
+    return fetch(postTarget, {
+        method: 'POST',
+        body: formData,
+        credentials: 'same-origin'
+    });
+}
+
 <?php if (isAdmin()): ?>
 // ADMIN DASHBOARD
 const adminStatsGrid = document.getElementById('adminStatsGrid');
@@ -2884,7 +3166,7 @@ async function adminFetch(action, payload = {}) {
     formData.append('action', action);
     Object.entries(payload).forEach(([key, val]) => formData.append(key, val));
 
-    const response = await fetch('', { method: 'POST', body: formData });
+    const response = await postFormData(formData);
     return response.json();
 }
 
@@ -3045,7 +3327,7 @@ function renderBanned(banned) {
 }
 
 async function loadAdminStats() {
-    const response = await fetch('?action=admin_get_stats');
+    const response = await fetch(buildUrl({ action: 'admin_get_stats' }), { credentials: 'same-origin' });
     const result = await response.json();
     if (result.success) {
         renderAdminStats(result.stats);
@@ -3053,7 +3335,7 @@ async function loadAdminStats() {
 }
 
 async function loadAdminReports() {
-    const response = await fetch('?action=admin_get_reports');
+    const response = await fetch(buildUrl({ action: 'admin_get_reports' }), { credentials: 'same-origin' });
     const result = await response.json();
     if (result.success) {
         renderReports(result.reports);
@@ -3061,7 +3343,7 @@ async function loadAdminReports() {
 }
 
 async function loadAdminFlagged() {
-    const response = await fetch('?action=admin_get_flagged');
+    const response = await fetch(buildUrl({ action: 'admin_get_flagged' }), { credentials: 'same-origin' });
     const result = await response.json();
     if (result.success) {
         renderFlagged(result.flagged);
@@ -3069,7 +3351,7 @@ async function loadAdminFlagged() {
 }
 
 async function loadAdminBanned() {
-    const result = await fetch('?action=admin_get_banned_users');
+    const result = await fetch(buildUrl({ action: 'admin_get_banned_users' }), { credentials: 'same-origin' });
     const data = await result.json();
     if (data.success) {
         renderBanned(data.banned);
@@ -3152,7 +3434,7 @@ adminLoginForm.addEventListener('submit', async (e) => {
     formData.append('password', document.getElementById('adminPassword').value);
 
     try {
-        const response = await fetch('', { method: 'POST', body: formData });
+        const response = await postFormData(formData);
         const result = await response.json();
 
         if (result.success) {
@@ -3168,9 +3450,49 @@ adminLoginForm.addEventListener('submit', async (e) => {
 });
 
 <?php elseif (!isLoggedIn()): ?>
-// REGISTRATION
-document.getElementById('registerForm').addEventListener('submit', async (e) => {
+// AUTH FORMS
+const authToggleButtons = document.querySelectorAll('.auth-toggle-button');
+const registerForm = document.getElementById('registerForm');
+const loginForm = document.getElementById('loginForm');
+const registerErrorEl = document.getElementById('registerError');
+const loginErrorEl = document.getElementById('loginError');
+const loginTakeoverBox = document.getElementById('loginTakeoverBox');
+const loginTakeoverBtn = document.getElementById('loginTakeoverBtn');
+let lastLoginCredentials = null;
+let isSubmittingLogin = false;
+
+function hideElement(el) {
+    if (!el) return;
+    el.style.display = 'none';
+    el.textContent = '';
+}
+
+function showAuthView(view) {
+    if (view === 'login') {
+        registerForm?.classList.add('hidden');
+        loginForm?.classList.remove('hidden');
+        hideElement(registerErrorEl);
+    } else {
+        loginForm?.classList.add('hidden');
+        registerForm?.classList.remove('hidden');
+        hideElement(loginErrorEl);
+        if (loginTakeoverBox) {
+            loginTakeoverBox.style.display = 'none';
+        }
+    }
+}
+
+authToggleButtons.forEach(button => {
+    button.addEventListener('click', () => {
+        authToggleButtons.forEach(btn => btn.classList.toggle('active', btn === button));
+        showAuthView(button.dataset.target === 'login' ? 'login' : 'register');
+    });
+});
+
+registerForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
+
+    hideElement(registerErrorEl);
 
     const username = document.getElementById('username').value.trim();
     const birthdate = document.getElementById('birthdate').value;
@@ -3180,22 +3502,97 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
     formData.append('action', 'register');
     formData.append('username', username);
     formData.append('birthdate', birthdate);
-    formData.append('agreed_terms', agreedTerms);
+    formData.append('agreed_terms', agreedTerms ? 'true' : 'false');
 
     try {
-        const response = await fetch('', { method: 'POST', body: formData });
+        const response = await postFormData(formData);
         const result = await response.json();
 
         if (result.success) {
             window.location.reload();
-        } else {
-            document.getElementById('errorMessage').textContent = result.error;
-            document.getElementById('errorMessage').style.display = 'block';
+        } else if (registerErrorEl) {
+            registerErrorEl.textContent = result.error || 'Registrierung fehlgeschlagen.';
+            registerErrorEl.style.display = 'block';
         }
     } catch (error) {
-        document.getElementById('errorMessage').textContent = 'Verbindungsfehler';
-        document.getElementById('errorMessage').style.display = 'block';
+        if (registerErrorEl) {
+            registerErrorEl.textContent = 'Verbindungsfehler';
+            registerErrorEl.style.display = 'block';
+        }
     }
+});
+
+async function submitLogin(force = false) {
+    if (!lastLoginCredentials || isSubmittingLogin) {
+        return;
+    }
+
+    isSubmittingLogin = true;
+
+    if (loginErrorEl) {
+        loginErrorEl.textContent = '';
+        loginErrorEl.style.display = 'none';
+    }
+
+    if (loginTakeoverBox) {
+        loginTakeoverBox.style.display = 'none';
+    }
+
+    const formData = new FormData();
+    formData.append('action', 'login');
+    formData.append('username', lastLoginCredentials.username);
+    formData.append('birthdate', lastLoginCredentials.birthdate);
+    formData.append('force_login', force ? '1' : '0');
+
+    try {
+        const response = await postFormData(formData);
+        const result = await response.json();
+
+        if (result.success) {
+            window.location.reload();
+            return;
+        }
+
+        if (loginErrorEl) {
+            loginErrorEl.textContent = result.error || 'Anmeldung fehlgeschlagen.';
+            loginErrorEl.style.display = 'block';
+        }
+
+        if (result.can_force && loginTakeoverBox) {
+            loginTakeoverBox.style.display = 'block';
+        }
+    } catch (error) {
+        if (loginErrorEl) {
+            loginErrorEl.textContent = 'Verbindungsfehler';
+            loginErrorEl.style.display = 'block';
+        }
+    } finally {
+        isSubmittingLogin = false;
+    }
+}
+
+loginForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    if (loginErrorEl) {
+        loginErrorEl.textContent = '';
+        loginErrorEl.style.display = 'none';
+    }
+
+    if (loginTakeoverBox) {
+        loginTakeoverBox.style.display = 'none';
+    }
+
+    lastLoginCredentials = {
+        username: document.getElementById('loginUsername').value.trim(),
+        birthdate: document.getElementById('loginBirthdate').value
+    };
+
+    await submitLogin(false);
+});
+
+loginTakeoverBtn?.addEventListener('click', async () => {
+    await submitLogin(true);
 });
 
 <?php else: ?>
@@ -3541,7 +3938,7 @@ async function markAsRead(userId) {
     formData.append('action', 'mark_read');
     formData.append('user_id', userId);
 
-    await fetch('', { method: 'POST', body: formData });
+    await postFormData(formData);
     loadUsers();
 }
 
@@ -3598,7 +3995,13 @@ function startSSE() {
                 }
             });
 
-            loadUsers();
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'messages') {
+                processIncomingMessages(Array.isArray(data.messages) ? data.messages : []);
+            }
+        } catch (error) {
+            console.warn('Konnte SSE-Daten nicht verarbeiten:', error);
         }
     };
 
@@ -3639,7 +4042,7 @@ userSearchInput?.addEventListener('input', () => renderUserList());
 document.getElementById('logoutBtn')?.addEventListener('click', async () => {
     const formData = new FormData();
     formData.append('action', 'logout');
-    await fetch('', { method: 'POST', body: formData });
+    await postFormData(formData);
     window.location.reload();
 });
 
@@ -3651,11 +4054,11 @@ chatInputEl?.addEventListener('input', function() {
 setInterval(async () => {
     const formData = new FormData();
     formData.append('action', 'ping');
-    await fetch('', { method: 'POST', body: formData });
+    await postFormData(formData);
 }, 10000);
 
 loadUsers();
-startSSE();
+startRealtime();
 setInterval(loadUsers, 30000);
 
 <?php endif; ?>
