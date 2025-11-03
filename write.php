@@ -35,6 +35,13 @@ define('MAX_MESSAGES_PER_FETCH', 200);
 define('MAX_MESSAGES_PER_MINUTE', 10);
 define('MAX_MESSAGES_PER_HOUR', 100);
 define('MAX_MESSAGES_PER_DAY_U18', 50);
+define('UPLOAD_DIR', __DIR__ . '/uploads');
+define('MAX_ATTACHMENT_SIZE', 200 * 1024); // 200 KB
+
+// Upload-Verzeichnis erstellen
+if (!is_dir(UPLOAD_DIR)) {
+    mkdir(UPLOAD_DIR, 0755, true);
+}
 
 // Admin Credentials (BITTE ÄNDERN!)
 define('ADMIN_USERNAME', 'admin');
@@ -89,21 +96,28 @@ function getDB() {
         )
     ');
     
+ 
+
+
     // Messages Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_user_id INTEGER NOT NULL,
-            to_user_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_read INTEGER DEFAULT 0,
-            is_flagged INTEGER DEFAULT 0,
-            flag_reason TEXT,
-            FOREIGN KEY (from_user_id) REFERENCES users(id),
-            FOREIGN KEY (to_user_id) REFERENCES users(id)
-        )
-    ');
+$db->exec('
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_user_id INTEGER NOT NULL,
+        to_user_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        is_read INTEGER DEFAULT 0,
+        is_flagged INTEGER DEFAULT 0,
+        flag_reason TEXT,
+        attachment_path TEXT,
+        attachment_type TEXT,
+        attachment_size INTEGER,
+        FOREIGN KEY (from_user_id) REFERENCES users(id),
+        FOREIGN KEY (to_user_id) REFERENCES users(id)
+    )
+');
+
     
     // Online Status Table
     $db->exec('
@@ -187,23 +201,21 @@ function getDB() {
     ');
     
     // Create default admin if not exists
-    $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
-    $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-    $result = $stmt->execute();
-    $row = $result->fetchArray(SQLITE3_ASSOC);
-    
-    if ($row['count'] == 0) {
-        $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
-        $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-        $result = $stmt->execute();
-        $row = $result->fetchArray(SQLITE3_ASSOC);
+   // Admin-Account erstellen (nur einmal!)
+$stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
+$stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+$result = $stmt->execute();
+$row = $result->fetchArray(SQLITE3_ASSOC);
 
-        if ($row['count'] == 0) {
-            $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
-            $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-            $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
-            $stmt->execute();
-        }
+if ($row['count'] == 0) {
+    $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
+    $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+    $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
+    $stmt->execute();
+}
+
+
+ 
 
         // Create indexes
         $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user_id, to_user_id)');
@@ -1830,8 +1842,16 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     echo "retry: " . SSE_RETRY_MS . "\n\n";
     flush();
     
-    $db = getDB();
+    $lastPingTime = time();
     
+    // ✅ ENDLOSSCHLEIFE HINZUFÜGEN!
+    while (true) {
+        if (connection_aborted()) {
+            break;
+        }
+        
+        $db = getDB();
+        
         $stmt = $db->prepare('
             SELECT
                 m.id,
@@ -1846,54 +1866,66 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                 uf.user_id as from_display_id,
                 uf.age_group as from_age_group,
                 ut.age_group as to_age_group
-        FROM messages m
-        JOIN users uf ON m.from_user_id = uf.id
-        JOIN users ut ON m.to_user_id = ut.id
-        WHERE m.id > :last_message_id
-        AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
-        AND NOT EXISTS (
-            SELECT 1 FROM blocks
-            WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
-            OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
-        )
-        ORDER BY m.id ASC
-    ');
-    $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
-    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $messages = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+            FROM messages m
+            JOIN users uf ON m.from_user_id = uf.id
+            JOIN users ut ON m.to_user_id = ut.id
+            WHERE m.id > :last_message_id
+            AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
+            AND NOT EXISTS (
+                SELECT 1 FROM blocks
+                WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
+                OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
+            )
+            ORDER BY m.id ASC
+        ');
+        $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
+        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        
+        $messages = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
 
-        if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
-            continue;
+            if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+                continue;
+            }
+
+            $messages[] = [
+                'id' => $row['id'],
+                'from_user_id' => $row['from_user_id'],
+                'to_user_id' => $row['to_user_id'],
+                'message' => $row['message'],
+                'timestamp' => $row['timestamp'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
+                'from_username' => $row['from_username'],
+                'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
+            ];
+            
+            $lastMessageId = max($lastMessageId, (int)$row['id']);
         }
-
-        $messages[] = [
-            'id' => $row['id'],
-            'from_user_id' => $row['from_user_id'],
-            'to_user_id' => $row['to_user_id'],
-            'message' => $row['message'],
-            'timestamp' => $row['timestamp'],
-            'attachment_url' => $row['attachment_path'] ?: null,
-            'attachment_type' => $row['attachment_type'] ?: null,
-            'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
-            'from_username' => $row['from_username'],
-            'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
-        ];
-    }
-    
-    if (!empty($messages)) {
-        echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
-        flush();
-    } else {
-        echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
-        flush();
+        
+        if (!empty($messages)) {
+            echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
+            flush();
+        }
+        
+        // Ping alle 15 Sekunden
+        if (time() - $lastPingTime >= 15) {
+            echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
+            flush();
+            $lastPingTime = time();
+            touchUserSession($currentUserId);
+        }
+        
+        // Kurze Pause, um CPU zu schonen
+        usleep(500000); // 0.5 Sekunden
     }
     
     exit;
 }
+
 
 // ═══════════════════════════════════════════════════════════
 // HTML OUTPUT
@@ -3803,7 +3835,6 @@ function selectUser(userId, displayName) {
     renderUserList();
     loadMessages(userId);
 }
-
 async function loadMessages(userId) {
     if (!userId) {
         return;
@@ -3813,12 +3844,18 @@ async function loadMessages(userId) {
     updateChatState('loading', 'Nachrichten werden geladen…');
 
     try {
-        const response = await fetch(`?action=get_messages&user_id=${userId}`);
+        const response = await fetch(buildUrl({ action: 'get_messages', user_id: userId }));
+        
         if (!response.ok) {
             throw new Error('NETZWERK_FEHLER');
         }
 
-        const result = await response.json();
+        const text = await response.text();
+        if (!text || text.trim() === '') {
+            throw new Error('Leere Antwort vom Server');
+        }
+
+        const result = JSON.parse(text);
 
         if (!result.success) {
             throw new Error(result.error || 'Nachrichten konnten nicht geladen werden.');
@@ -3851,6 +3888,7 @@ async function loadMessages(userId) {
         state.isLoadingMessages = false;
     }
 }
+
 
 function renderMessages() {
     const container = chatMessagesEl;
@@ -3889,49 +3927,126 @@ function renderMessages() {
     updateChatState(null);
 }
 
-async function sendMessage() {
-    if (!chatInputEl) {
+
+
+let attachmentFile = null;
+const ATTACHMENT_MAX_SIZE = 200 * 1024; // 200 KB
+
+const attachmentButton = document.getElementById('attachmentButton');
+const attachmentInput = document.getElementById('attachmentInput');
+const attachmentInfo = document.getElementById('attachmentInfo');
+const attachmentFileName = document.getElementById('attachmentFileName');
+const attachmentClearBtn = document.getElementById('attachmentClearBtn');
+const attachmentWarning = document.getElementById('attachmentWarning');
+
+function escapeAttribute(text) {
+    const div = document.createElement('div');
+    div.textContent = text ?? '';
+    return div.innerHTML.replace(/"/g, '&quot;');
+}
+
+function showAttachmentWarning(message) {
+    if (attachmentWarning) {
+        attachmentWarning.textContent = message;
+        attachmentWarning.classList.remove('hidden');
+    }
+}
+
+function clearAttachmentWarning() {
+    if (attachmentWarning) {
+        attachmentWarning.textContent = '';
+        attachmentWarning.classList.add('hidden');
+    }
+}
+
+function clearAttachmentSelection() {
+    attachmentFile = null;
+    if (attachmentInput) attachmentInput.value = '';
+    if (attachmentInfo) attachmentInfo.classList.add('hidden');
+    if (attachmentFileName) attachmentFileName.textContent = '';
+    clearAttachmentWarning();
+}
+
+attachmentButton?.addEventListener('click', () => {
+    attachmentInput?.click();
+});
+
+attachmentInput?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+        clearAttachmentSelection();
         return;
     }
-
-    const message = chatInputEl.value.trim();
-
-    clearAttachmentWarning();
-
-    if (attachmentFile) {
-        const fileType = (attachmentFile.type || '').toLowerCase();
-        const fileName = attachmentFile.name || '';
-        const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
-
-        if (!isJpeg) {
-            showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
-            clearAttachmentSelection();
-            return;
-        }
-
-        if (attachmentFile.size > ATTACHMENT_MAX_SIZE) {
-            showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
-            clearAttachmentSelection();
-            return;
-        }
+    
+    const fileType = (file.type || '').toLowerCase();
+    const fileName = file.name || '';
+    const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
+    
+    if (!isJpeg) {
+        showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
+        clearAttachmentSelection();
+        return;
     }
+    
+    if (file.size > ATTACHMENT_MAX_SIZE) {
+        showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
+        clearAttachmentSelection();
+        return;
+    }
+    
+    attachmentFile = file;
+    if (attachmentFileName) {
+        attachmentFileName.textContent = fileName;
+    }
+    if (attachmentInfo) {
+        attachmentInfo.classList.remove('hidden');
+    }
+    clearAttachmentWarning();
+});
 
+attachmentClearBtn?.addEventListener('click', clearAttachmentSelection);
+
+
+async function sendMessage() {
+    if (!chatInputEl) return;
+    
+    const message = chatInputEl.value.trim();
+    
+    if (!message && !attachmentFile) {
+        return;
+    }
+    
+    if (!state.selectedUserId) {
+        alert('Bitte wähle einen Chat-Partner aus');
+        return;
+    }
+    
     const formData = new FormData();
     formData.append('action', 'send_message');
     formData.append('to_user_id', state.selectedUserId);
     formData.append('message', message);
-
+    
     if (attachmentFile) {
         formData.append('attachment', attachmentFile);
     }
-
-    if (result.success) {
-        chatInputEl.value = '';
-        chatInputEl.dispatchEvent(new Event('input'));
-    } else {
-        alert(result.error);
+    
+    try {
+        const response = await postFormData(formData);
+        const result = await response.json();
+        
+        if (result.success) {
+            chatInputEl.value = '';
+            chatInputEl.style.height = 'auto';
+            clearAttachmentSelection();
+            // Nachricht wird via SSE empfangen
+        } else {
+            alert(result.error || 'Nachricht konnte nicht gesendet werden');
+        }
+    } catch (error) {
+        alert('Verbindungsfehler beim Senden');
     }
 }
+
 
 async function markAsRead(userId) {
     const formData = new FormData();
@@ -3941,86 +4056,72 @@ async function markAsRead(userId) {
     await postFormData(formData);
     loadUsers();
 }
-
 function startSSE() {
     if (state.eventSource) {
         state.eventSource.close();
     }
 
-    const url = `?stream=events&last_message_id=${state.lastMessageId}&t=${Date.now()}`;
+    const url = buildUrl({
+        stream: 'events',
+        last_message_id: state.lastMessageId
+    });
+    
     state.eventSource = new EventSource(url);
 
     state.eventSource.onopen = () => {
         state.connectionErrorShown = false;
-
-        if (!state.selectedUserId) {
-            return;
-        }
-
-        if (state.isLoadingMessages) {
-            return;
-        }
-
-        if (state.messages.length === 0) {
-            updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
-        } else {
-            updateChatState(null);
-        }
     };
 
     state.eventSource.onmessage = (event) => {
-        state.connectionErrorShown = false;
-        const data = JSON.parse(event.data);
-
-        if (data.type === 'messages' && data.messages) {
-            data.messages.forEach(msg => {
-                const messageId = Number(msg.id);
-
-                if (messageId > state.lastMessageId) {
-                    state.lastMessageId = messageId;
-
-                    if (state.selectedUserId &&
-                        ((msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
-                         (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId))) {
-
-                        if (!state.messages.find(m => Number(m.id) === messageId)) {
-                            state.messages.push(msg);
-                            renderMessages();
-
-                            if (msg.to_user_id === state.currentUserId) {
-                                markAsRead(msg.from_user_id);
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'messages' && Array.isArray(data.messages)) {
+                data.messages.forEach(msg => {
+                    const messageId = Number(msg.id);
+                    
+                    if (messageId > state.lastMessageId) {
+                        state.lastMessageId = messageId;
+                        
+                        const isRelevant = state.selectedUserId && (
+                            (msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
+                            (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId)
+                        );
+                        
+                        if (isRelevant) {
+                            const exists = state.messages.some(m => Number(m.id) === messageId);
+                            if (!exists) {
+                                state.messages.push(msg);
+                                renderMessages();
+                                
+                                if (msg.to_user_id === state.currentUserId) {
+                                    markAsRead(msg.from_user_id);
+                                }
                             }
                         }
                     }
-                }
-            });
-
-        try {
-            const data = JSON.parse(event.data);
-            if (data.type === 'messages') {
-                processIncomingMessages(Array.isArray(data.messages) ? data.messages : []);
+                });
+                
+                loadUsers(); // Aktualisiere Nutzerliste
             }
         } catch (error) {
-            console.warn('Konnte SSE-Daten nicht verarbeiten:', error);
+            console.warn('SSE-Daten konnten nicht verarbeitet werden:', error);
         }
     };
 
     state.eventSource.onerror = () => {
         if (!state.connectionErrorShown) {
             state.connectionErrorShown = true;
-            console.warn('SSE-Verbindung unterbrochen, versuche Neuverbindung.');
-            if (state.selectedUserId && !state.isLoadingMessages) {
-                updateChatState('error', 'Live-Verbindung unterbrochen. Erneuter Verbindungsversuch…');
-            }
+            console.warn('SSE-Verbindung unterbrochen');
         }
-
+        
         if (state.eventSource) {
             state.eventSource.close();
         }
-
-        setTimeout(startSSE, 1500);
+        
+        setTimeout(startSSE, 2000);
     };
 }
+
 
 function escapeHtml(text) {
     const div = document.createElement('div');
@@ -4058,7 +4159,7 @@ setInterval(async () => {
 }, 10000);
 
 loadUsers();
-startRealtime();
+startSSE();
 setInterval(loadUsers, 30000);
 
 <?php endif; ?>
