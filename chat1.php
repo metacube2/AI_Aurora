@@ -339,6 +339,20 @@ function logSecurityEvent($userId, $action, $details = '') {
     $stmt->execute();
 }
 
+function canUsersChatByAge($ageGroupA, $ageGroupB) {
+    if (!$ageGroupA || !$ageGroupB) {
+        return false;
+    }
+
+    // Wenn einer minderjährig ist, müssen beide minderjährig sein
+    if ($ageGroupA === 'U18' || $ageGroupB === 'U18') {
+        return $ageGroupA === 'U18' && $ageGroupB === 'U18';
+    }
+
+    // Volljährige dürfen miteinander chatten
+    return true;
+}
+
 function isBlocked($userId, $otherUserId) {
     $db = getDB();
     $stmt = $db->prepare('
@@ -375,6 +389,7 @@ function cleanupOldData() {
 // ═══════════════════════════════════════════════════════════
 
 session_start();
+$isAdminPage = isset($_GET['admin']);
 
 function isLoggedIn() {
     return isset($_SESSION['user_id']) && isset($_SESSION['username']);
@@ -584,48 +599,59 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $currentAgeGroup = getCurrentAgeGroup();
         
         $query = '
-            SELECT 
+            SELECT
                 u.id,
                 u.username,
                 u.user_id as display_id,
                 u.age_group,
                 u.last_seen,
-                CASE 
-                    WHEN os.last_ping IS NOT NULL 
+                CASE
+                    WHEN os.last_ping IS NOT NULL
                     AND (julianday("now") - julianday(os.last_ping)) * 86400 < ' . ONLINE_TIMEOUT_SECONDS . '
-                    THEN 1 
-                    ELSE 0 
+                    THEN 1
+                    ELSE 0
                 END as is_online,
                 (
-                    SELECT COUNT(*) 
-                    FROM messages 
-                    WHERE from_user_id = u.id 
-                    AND to_user_id = :current_user_id 
+                    SELECT COUNT(*)
+                    FROM messages
+                    WHERE from_user_id = u.id
+                    AND to_user_id = :current_user_id
                     AND is_read = 0
                 ) as unread_count,
                 (
-                    SELECT COUNT(*) 
-                    FROM blocks 
-                    WHERE blocker_id = :current_user_id 
+                    SELECT COUNT(*)
+                    FROM blocks
+                    WHERE blocker_id = :current_user_id
                     AND blocked_id = u.id
                 ) as is_blocked_by_me,
                 (
-                    SELECT COUNT(*) 
-                    FROM blocks 
-                    WHERE blocker_id = u.id 
+                    SELECT COUNT(*)
+                    FROM blocks
+                    WHERE blocker_id = u.id
                     AND blocked_id = :current_user_id
                 ) as has_blocked_me
             FROM users u
             LEFT JOIN online_status os ON u.id = os.user_id
             WHERE u.id != :current_user_id
             AND u.is_banned = 0
-            AND u.age_group = :age_group
-            ORDER BY is_online DESC, u.username ASC
         ';
-        
+
+        if ($currentAgeGroup === 'U18') {
+            $query .= ' AND u.age_group = :allowed_group';
+        } else {
+            $query .= ' AND u.age_group != :blocked_group';
+        }
+
+        $query .= ' ORDER BY is_online DESC, u.username ASC';
+
         $stmt = $db->prepare($query);
         $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':age_group', $currentAgeGroup, SQLITE3_TEXT);
+
+        if ($currentAgeGroup === 'U18') {
+            $stmt->bindValue(':allowed_group', 'U18', SQLITE3_TEXT);
+        } else {
+            $stmt->bindValue(':blocked_group', 'U18', SQLITE3_TEXT);
+        }
         $result = $stmt->execute();
         
         $users = [];
@@ -655,23 +681,40 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'get_messages') {
         $otherUserId = intval($_GET['user_id'] ?? 0);
-        
+
         if ($otherUserId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
+
         // Check if blocked
         if (isBlocked(getCurrentUserId(), $otherUserId)) {
             echo json_encode(['success' => false, 'error' => 'Chat nicht verfügbar']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
-        
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $otherUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$otherUser) {
+            echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "GET_MESSAGES -> User $otherUserId");
+            echo json_encode(['success' => false, 'error' => 'Chat zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         $query = '
-            SELECT 
+            SELECT
                 m.id,
                 m.from_user_id,
                 m.to_user_id,
@@ -745,7 +788,23 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $db = getDB();
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
-        
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $toUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $targetUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$targetUser) {
+            echo json_encode(['success' => false, 'error' => 'Empfänger nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $targetUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "SEND_MESSAGE -> User $toUserId");
+            echo json_encode(['success' => false, 'error' => 'Nachrichten zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         // Rate Limiting
         $rateLimitCheck = checkRateLimit($currentUserId, $currentAgeGroup);
         if (!$rateLimitCheck['allowed']) {
@@ -758,9 +817,8 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $keywordCheck = checkKeywordBlacklist($message);
         if ($keywordCheck['blocked']) {
             logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
-            echo
             echo json_encode([
-                'success' => false, 
+                'success' => false,
                 'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
                 'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
             ]);
@@ -853,14 +911,31 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
-        
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $otherUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$otherUser) {
+            echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "MARK_READ -> User $otherUserId");
+            echo json_encode(['success' => false, 'error' => 'Aktion zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         $stmt = $db->prepare('
-            UPDATE messages 
-            SET is_read = 1 
-            WHERE from_user_id = :other_user_id 
+            UPDATE messages
+            SET is_read = 1
+            WHERE from_user_id = :other_user_id
             AND to_user_id = :current_user_id 
             AND is_read = 0
         ');
@@ -1156,7 +1231,32 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         ]);
         exit;
     }
-    
+
+    if ($action === 'admin_get_banned_users') {
+        $db = getDB();
+
+        $result = $db->query('
+            SELECT id, username, user_id as display_id, ban_reason, last_seen
+            FROM users
+            WHERE is_banned = 1
+            ORDER BY last_seen DESC
+            LIMIT 100
+        ');
+
+        $banned = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $banned[] = [
+                'id' => $row['id'],
+                'display_name' => $row['username'] . '#' . $row['display_id'],
+                'reason' => $row['ban_reason'] ?? 'keine Angabe',
+                'last_seen' => $row['last_seen']
+            ];
+        }
+
+        echo json_encode(['success' => true, 'banned' => $banned]);
+        exit;
+    }
+
     // ───────────────────────────────────────────────────────
     // ADMIN: BAN USER
     // ───────────────────────────────────────────────────────
@@ -1280,29 +1380,39 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     header('X-Accel-Buffering: no');
     
     $currentUserId = getCurrentUserId();
+    $currentAgeGroup = getCurrentAgeGroup();
     $lastMessageId = intval($_GET['last_message_id'] ?? 0);
     
     set_time_limit(0);
     ob_implicit_flush(true);
-    ob_end_flush();
+    while (ob_get_level() > 0) {
+        @ob_end_flush();
+    }
+
+    echo ": connected\n\n";
+    echo "retry: " . SSE_RETRY_MS . "\n\n";
+    flush();
     
     $db = getDB();
     
     $stmt = $db->prepare('
-        SELECT 
+        SELECT
             m.id,
             m.from_user_id,
             m.to_user_id,
             m.message,
             m.timestamp,
-            u.username as from_username,
-            u.user_id as from_display_id
+            uf.username as from_username,
+            uf.user_id as from_display_id,
+            uf.age_group as from_age_group,
+            ut.age_group as to_age_group
         FROM messages m
-        JOIN users u ON m.from_user_id = u.id
+        JOIN users uf ON m.from_user_id = uf.id
+        JOIN users ut ON m.to_user_id = ut.id
         WHERE m.id > :last_message_id
         AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
         AND NOT EXISTS (
-            SELECT 1 FROM blocks 
+            SELECT 1 FROM blocks
             WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
             OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
         )
@@ -1314,6 +1424,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     
     $messages = [];
     while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+            continue;
+        }
+
         $messages[] = [
             'id' => $row['id'],
             'from_user_id' => $row['from_user_id'],
@@ -1345,1347 +1461,6 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🔒 Sicherer Private Chat</title>
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Diese Nachricht enthält nicht erlaubte Inhalte: "' . $keywordCheck['keyword'] . '"',
-                'blocked_keyword' => true
-            ]);
-            exit;
-        }
-        
-        // Profanity Filter
-        $profanityCheck = checkProfanityFilter($message);
-        if ($profanityCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Bitte verwende keine Schimpfwörter',
-                'blocked_profanity' => true
-            ]);
-            exit;
-        }
-        
-        // Link Filter
-        $linkCheck = checkLinkFilter($message);
-        if ($linkCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Links sind nicht erlaubt',
-                'blocked_link' => true
-            ]);
-            exit;
-        }
-        
-        // Insert message
-        $stmt = $db->prepare('
-            INSERT INTO messages (from_user_id, to_user_id, message)
-            VALUES (:from_user_id, :to_user_id, :message)
-        ');
-        $stmt->bindValue(':from_user_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':to_user_id', $toUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':message', $message, SQLITE3_TEXT);
-        $stmt->execute();
-        
-        $messageId = $db->lastInsertRowID();
-        
-        // Log rate limit
-        logRateLimit($currentUserId);
-        
-        echo json_encode([
-            'success' => true,
-            'message_id' => $messageId,
-            'timestamp' => date('Y-m-d H:i:s')
-        ]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // MARK AS READ
-    // ───────────────────────────────────────────────────────
-    if ($action === 'mark_read') {
-        $otherUserId = intval($_POST['user_id'] ?? 0);
-        
-        if ($otherUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            UPDATE messages 
-            SET is_read = 1 
-            WHERE from_user_id = :other_user_id 
-            AND to_user_id = :current_user_id 
-            AND is_read = 0
-        ');
-        $stmt->bindValue(':other_user_id', $otherUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        echo json_encode(['success' => true]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // BLOCK USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'block_user') {
-        $blockUserId = intval($_POST['user_id'] ?? 0);
-        
-        if ($blockUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            INSERT OR IGNORE INTO blocks (blocker_id, blocked_id)
-            VALUES (:blocker_id, :blocked_id)
-        ');
-        $stmt->bindValue(':blocker_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':blocked_id', $blockUserId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent($currentUserId, 'USER_BLOCKED', "Blocked user ID: $blockUserId");
-        
-        echo json_encode(['success' => true]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // UNBLOCK USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'unblock_user') {
-        $unblockUserId = intval($_POST['user_id'] ?? 0);
-        
-        if ($unblockUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            DELETE FROM blocks 
-            WHERE blocker_id = :blocker_id 
-            AND blocked_id = :blocked_id
-        ');
-        $stmt->bindValue(':blocker_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':blocked_id', $unblockUserId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent($currentUserId, 'USER_UNBLOCKED', "Unblocked user ID: $unblockUserId");
-        
-        echo json_encode(['success' => true]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // REPORT USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'report_user') {
-        $reportedUserId = intval($_POST['user_id'] ?? 0);
-        $reason = trim($_POST['reason'] ?? '');
-        $messageId = intval($_POST['message_id'] ?? 0);
-        
-        if ($reportedUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        if (empty($reason)) {
-            echo json_encode(['success' => false, 'error' => 'Bitte gib einen Grund an']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            INSERT INTO reports (reporter_id, reported_user_id, reason, message_id)
-            VALUES (:reporter_id, :reported_user_id, :reason, :message_id)
-        ');
-        $stmt->bindValue(':reporter_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':reported_user_id', $reportedUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
-        $stmt->bindValue(':message_id', $messageId > 0 ? $messageId : null, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent($currentUserId, 'USER_REPORTED', "Reported user ID: $reportedUserId, Reason: $reason");
-        
-        // Flag message if provided
-        if ($messageId > 0) {
-            $stmt = $db->prepare('
-                UPDATE messages 
-                SET is_flagged = 1, flag_reason = :reason 
-                WHERE id = :message_id
-            ');
-            $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
-            $stmt->bindValue(':message_id', $messageId, SQLITE3_INTEGER);
-            $stmt->execute();
-        }
-        
-        echo json_encode(['success' => true, 'message' => 'Meldung wurde erfasst. Danke!']);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // GET BLOCKED USERS
-    // ───────────────────────────────────────────────────────
-    if ($action === 'get_blocked_users') {
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $query = '
-            SELECT 
-                u.id,
-                u.username,
-                u.user_id as display_id,
-                b.timestamp as blocked_at
-            FROM blocks b
-            JOIN users u ON b.blocked_id = u.id
-            WHERE b.blocker_id = :current_user_id
-            ORDER BY b.timestamp DESC
-        ';
-        
-        $stmt = $db->prepare($query);
-        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-        $result = $stmt->execute();
-        
-        $blocked = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $blocked[] = [
-                'id' => $row['id'],
-                'username' => $row['username'],
-                'display_id' => $row['display_id'],
-                'display_name' => $row['username'] . '#' . $row['display_id'],
-                'blocked_at' => $row['blocked_at']
-            ];
-        }
-        
-        echo json_encode(['success' => true, 'blocked' => $blocked]);
-        exit;
-    }
-    
-    // ═══════════════════════════════════════════════════════════
-    // ADMIN ACTIONS
-    // ═══════════════════════════════════════════════════════════
-    
-    if (!isAdmin()) {
-        echo json_encode(['success' => false, 'error' => 'Admin-Rechte erforderlich']);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // GET ADMIN STATS
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_stats') {
-        $db = getDB();
-        
-        // Total users
-        $result = $db->query('SELECT COUNT(*) as count FROM users WHERE is_banned = 0');
-        $totalUsers = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // U18 users
-        $result = $db->query('SELECT COUNT(*) as count FROM users WHERE age_group = "U18" AND is_banned = 0');
-        $u18Users = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // O18 users
-        $result = $db->query('SELECT COUNT(*) as count FROM users WHERE age_group = "O18" AND is_banned = 0');
-        $o18Users = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Total messages today
-        $result = $db->query('SELECT COUNT(*) as count FROM messages WHERE DATE(timestamp) = DATE("now")');
-        $messagesToday = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Pending reports
-        $result = $db->query('SELECT COUNT(*) as count FROM reports WHERE status = "pending"');
-        $pendingReports = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Flagged messages
-        $result = $db->query('SELECT COUNT(*) as count FROM messages WHERE is_flagged = 1');
-        $flaggedMessages = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Banned users
-        $result = $db->query('SELECT COUNT(*) as count FROM users WHERE is_banned = 1');
-        $bannedUsers = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        echo json_encode([
-            'success' => true,
-            'stats' => [
-                'total_users' => $totalUsers,
-                'u18_users' => $u18Users,
-                'o18_users' => $o18Users,
-                'messages_today' => $messagesToday,
-                'pending_reports' => $pendingReports,
-                'flagged_messages' => $flaggedMessages,
-                'banned_users' => $bannedUsers
-            ]
-        ]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // GET REPORTS
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_get_reports') {
-        $db = getDB();
-        
-        $query = '
-            SELECT 
-                r.id,
-                r.reason,
-                r.timestamp,
-                r.status,
-                r.message_id,
-                reporter.username as reporter_name,
-                reporter.user_id as reporter_display_id,
-                reported.username as reported_name,
-                reported.user_id as reported_display_id,
-                reported.id as reported_user_id,
-                m.message as message_content
-            FROM reports r
-            JOIN users reporter ON r.reporter_id = reporter.id
-            JOIN users reported ON r.reported_user_id = reported.id
-            LEFT JOIN messages m ON r.message_id = m.id
-            ORDER BY r.timestamp DESC
-            LIMIT 50
-        ';
-        
-        $result = $db->query($query);
-        
-        $reports = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $reports[] = [
-                'id' => $row['id'],
-                'reason' => $row['reason'],
-                'timestamp' => $row['timestamp'],
-                'status' => $row['status'],
-                'reporter_name' => $row['reporter_name'] . '#' . $row['reporter_display_id'],
-                'reported_name' => $row['reported_name'] . '#' . $row['reported_display_id'],
-                'reported_user_id' => $row['reported_user_id'],
-                'message_content' => $row['message_content']
-            ];
-        }
-        
-        echo json_encode(['success' => true, 'reports' => $reports]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // BAN USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_ban_user') {
-        $userId = intval($_POST['user_id'] ?? 0);
-        $reason = trim($_POST['reason'] ?? 'Verstoß gegen Nutzungsbedingungen');
-        
-        if ($userId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        
-        $stmt = $db->prepare('
-            UPDATE users 
-            SET is_banned = 1, ban_reason = :reason 
-            WHERE id = :user_id
-        ');
-        $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
-        $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
-        $stmt->execute();
-        
-        logSecurityEvent(null, 'ADMIN_BAN_USER', "User ID: $userId, Reason: $reason");
-        
-        echo json_encode(['success' => true]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // UNBAN USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_unban_user') {
-        $userId = intval($_POST['user_id'] ?? 0);
-        
-        if ($userId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        
-        $stmt = $db->prepare('
-            UPDATE users 
-            SET is_banned = 0, ban_reason = NULL 
-            WHERE id = :user_id
-        ');
-        $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent(null, 'ADMIN_UNBAN_USER', "User ID: $userId");
-        
-        echo json_encode(['success' => true]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // RESOLVE REPORT
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_resolve_report') {
-        $reportId = intval($_POST['report_id'] ?? 0);
-        $status = $_POST['status'] ?? 'resolved';
-        
-        if ($reportId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige Report-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        
-        $stmt = $db->prepare('UPDATE reports SET status = :status WHERE id = :report_id');
-        $stmt->bindValue(':status', $status, SQLITE3_TEXT);
-        $stmt->bindValue(':report_id', $reportId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent(null, 'ADMIN_RESOLVE_REPORT', "Report ID: $reportId, Status: $status");
-        
-        echo json_encode(['success' => true]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // GET SECURITY LOGS
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_get_logs') {
-        $db = getDB();
-        
-        $query = '
-            SELECT 
-                l.id,
-                l.action,
-                l.details,
-                l.ip_address,
-                l.timestamp,
-                u.username,
-                u.user_id as display_id
-            FROM security_logs l
-            LEFT JOIN users u ON l.user_id = u.id
-            ORDER BY l.timestamp DESC
-            LIMIT 100
-        ';
-        
-        $result = $db->query($query);
-        
-        $logs = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $logs[] = [
-                'id' => $row['id'],
-                'action' => $row['action'],
-                'details' => $row['details'],
-                'ip_address' => $row['ip_address'],
-                'timestamp' => $row['timestamp'],
-                'username' => $row['username'] ? $row['username'] . '#' . $row['display_id'] : 'System'
-            ];
-        }
-        
-        echo json_encode(['success' => true, 'logs' => $logs]);
-        exit;
-    }
-    
-    echo json_encode(['success' => false, 'error' => 'Unbekannte Aktion']);
-    exit;
-}
-
-// ═══════════════════════════════════════════════════════════
-// SSE STREAM (ECHTZEIT)
-// ═══════════════════════════════════════════════════════════
-
-if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
-    if (!isLoggedIn()) {
-        exit;
-    }
-    
-    header('Content-Type: text/event-stream');
-    header('Cache-Control: no-cache');
-    header('Connection: keep-alive');
-    header('X-Accel-Buffering: no');
-    
-    $currentUserId = getCurrentUserId();
-    $lastMessageId = intval($_GET['last_message_id'] ?? 0);
-    
-    set_time_limit(0);
-    ob_implicit_flush(true);
-    ob_end_flush();
-    
-    $db = getDB();
-    
-    $stmt = $db->prepare('
-        SELECT 
-            m.id,
-            m.from_user_id,
-            m.to_user_id,
-            m.message,
-            m.timestamp,
-            u.username as from_username,
-            u.user_id as from_display_id
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.id > :last_message_id
-        AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
-        ORDER BY m.id ASC
-    ');
-    $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
-    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $messages = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $messages[] = [
-            'id' => $row['id'],
-            'from_user_id' => $row['from_user_id'],
-            'to_user_id' => $row['to_user_id'],
-            'message' => $row['message'],
-            'timestamp' => $row['timestamp'],
-            'from_username' => $row['from_username'],
-            'from_display_id' => $row['from_display_id'],
-            'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
-        ];
-    }
-    
-    if (!empty($messages)) {
-        echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
-        flush();
-    } else {
-        echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
-        flush();
-    }
-    
-    exit;
-}
-
-// ═══════════════════════════════════════════════════════════
-// HTML OUTPUT
-// ═══════════════════════════════════════════════════════════
-?>
-<!DOCTYPE html>
-<html lang="de">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>💬 Secure Private Chat</title>
-    
-    <style>
-        /* ═══════════════════════════════════════════════════════════ */
-        /* CSS STYLING */
-        /* ═══════════════════════════════════════════════════════════ */
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        
-        /* ───────────────────────────────────────────────────────── */
-        /* REGISTRATION SCREEN */
-        /* ───────────────────────────────────────────────────────── */
-        
-        .register-container {
-            background: white;
-            padding: 40px;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            max-width: 500px;
-            width: 100%;
-        }
-        
-        .register-container h1 {
-            color: #667eea;
-            margin-bottom: 10px;
-            font-size: 32px;
-            text-align: center;
-        }
-        
-        .register-container .subtitle {
-            color: #666;
-            margin-bottom: 30px;
-            text-align: center;
-        }
-        
-        .form-group {
-            margin-bottom: 20px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            color: #333;
-            font-weight: 600;
-        }
-        
-        .form-group input {
-            width: 100%;
-            padding: 12px 15px;
-            border: 2px solid #e0e0e0;
-            border-radius: 10px;
-            font-size: 16px;
-            transition: border-color 0.3s;
-        }
-        
-        .form-group input:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        
-        .terms-box {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            max-height: 200px;
-            overflow-y: auto;
-            font-size: 14px;
-            line-height: 1.6;
-            color: #555;
-        }
-        
-        .terms-box h3 {
-            color: #667eea;
-            margin-bottom: 10px;
-        }
-        
-        .terms-box ul {
-            margin-left: 20px;
-        }
-        
-        .terms-box li {
-            margin-bottom: 8px;
-        }
-        
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-        
-        .checkbox-group input[type="checkbox"] {
-            width: 20px;
-            height: 20px;
-            margin-right: 10px;
-            cursor: pointer;
-        }
-        
-        .checkbox-group label {
-            color: #333;
-            cursor: pointer;
-        }
-        
-        .btn-primary {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: transform 0.2s;
-        }
-        
-        .btn-primary:hover {
-            transform: translateY(-2px);
-        }
-        
-        .btn-primary:active {
-            transform: translateY(0);
-        }
-        
-        .btn-primary:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
-        .error-message {
-            background: #fee;
-            color: #c33;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            display: none;
-            font-size: 14px;
-        }
-        
-        .success-message {
-            background: #efe;
-            color: #3c3;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            display: none;
-            font-size: 14px;
-        }
-        
-        .info-box {
-            background: #e3f2fd;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-size: 14px;
-            color: #1976d2;
-        }
-        
-        .age-warning {
-            background: #fff3cd;
-            color: #856404;
-            padding: 12px;
-            border-radius: 8px;
-            margin-top: 10px;
-            font-size: 13px;
-        }
-        
-        /* ───────────────────────────────────────────────────────── */
-        /* ADMIN LOGIN */
-        /* ───────────────────────────────────────────────────────── */
-        
-        .admin-link {
-            text-align: center;
-            margin-top: 20px;
-            font-size: 14px;
-        }
-        
-        .admin-link a {
-            color: #667eea;
-            text-decoration: none;
-        }
-        
-        .admin-link a:hover {
-            text-decoration: underline;
-        }
-        
-        /* ───────────────────────────────────────────────────────── */
-        /* CHAT CONTAINER */
-        /* ───────────────────────────────────────────────────────── */
-        
-        .chat-container {
-            display: none;
-            width: 95%;
-            max-width: 1400px;
-            height: 90vh;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            overflow: hidden;
-            grid-template-columns: 350px 1fr;
-            grid-template-rows: 60px 1fr;
-        }
-        
-        .chat-container.show {
-            display: grid;
-        }
-        
-        /* Chat Header */
-        .chat-header {
-            grid-column: 1 / -1;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 0 20px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-        
-        .chat-header h1 {
-            font-size: 20px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .chat-header .user-info {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .chat-header .username {
-            font-weight: bold;
-        }
-        
-        .chat-header .age-badge {
-            background: rgba(255,255,255,0.3);
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 12px;
-        }
-        
-        .chat-header button {
-            background: rgba(255,255,255,0.2);
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 5px;
-            cursor: pointer;
-            transition: background 0.3s;
-        }
-        
-        .chat-header button:hover {
-            background: rgba(255,255,255,0.3);
-        }
-        
-        /* Sidebar */
-        .sidebar {
-            background: #f5f5f5;
-            border-right: 1px solid #e0e0e0;
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .sidebar-tabs {
-            display: flex;
-            background: white;
-            border-bottom: 1px solid #e0e0e0;
-        }
-        
-        .sidebar-tab {
-            flex: 1;
-            padding: 12px;
-            text-align: center;
-            cursor: pointer;
-            border-bottom: 3px solid transparent;
-            transition: all 0.3s;
-        }
-        
-        .sidebar-tab.active {
-            border-bottom-color: #667eea;
-            color: #667eea;
-            font-weight: bold;
-        }
-        
-        .sidebar-search {
-            padding: 15px;
-            background: white;
-            border-bottom: 1px solid #e0e0e0;
-        }
-        
-        .sidebar-search input {
-            width: 100%;
-            padding: 10px 15px;
-            border: 1px solid #e0e0e0;
-            border-radius: 20px;
-            font-size: 14px;
-        }
-        
-        .sidebar-search input:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        
-        .user-list {
-            flex: 1;
-            overflow-y: auto;
-        }
-        
-        .user-item {
-            padding: 15px 20px;
-            border-bottom: 1px solid #e0e0e0;
-            cursor: pointer;
-            transition: background 0.2s;
-            display: flex;
-            align-items: center;
-            gap:
-                        echo json_encode([
-                'success' => false, 
-                'error' => 'Diese Nachricht enthält nicht erlaubte Inhalte. Gib niemals persönliche Daten weiter!',
-                'blocked_keyword' => $keywordCheck['keyword']
-            ]);
-            exit;
-        }
-        
-        // Profanity Filter
-        $profanityCheck = checkProfanityFilter($message);
-        if ($profanityCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Bitte verwende keine Schimpfwörter oder Beleidigungen.'
-            ]);
-            exit;
-        }
-        
-        // Link Filter
-        $linkCheck = checkLinkFilter($message);
-        if ($linkCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Links und URLs sind nicht erlaubt. Teile keine externen Kontakte!'
-            ]);
-            exit;
-        }
-        
-        // Insert message
-        $stmt = $db->prepare('
-            INSERT INTO messages (from_user_id, to_user_id, message)
-            VALUES (:from_user_id, :to_user_id, :message)
-        ');
-        $stmt->bindValue(':from_user_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':to_user_id', $toUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':message', $message, SQLITE3_TEXT);
-        $stmt->execute();
-        
-        $messageId = $db->lastInsertRowID();
-        
-        // Log rate limit
-        logRateLimit($currentUserId);
-        
-        echo json_encode([
-            'success' => true,
-            'message_id' => $messageId,
-            'timestamp' => date('Y-m-d H:i:s')
-        ]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // MARK AS READ
-    // ───────────────────────────────────────────────────────
-    if ($action === 'mark_read') {
-        $otherUserId = intval($_POST['user_id'] ?? 0);
-        
-        if ($otherUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            UPDATE messages 
-            SET is_read = 1 
-            WHERE from_user_id = :other_user_id 
-            AND to_user_id = :current_user_id 
-            AND is_read = 0
-        ');
-        $stmt->bindValue(':other_user_id', $otherUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        echo json_encode(['success' => true]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // BLOCK USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'block_user') {
-        $blockedUserId = intval($_POST['user_id'] ?? 0);
-        
-        if ($blockedUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            INSERT OR IGNORE INTO blocks (blocker_id, blocked_id)
-            VALUES (:blocker_id, :blocked_id)
-        ');
-        $stmt->bindValue(':blocker_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':blocked_id', $blockedUserId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent($currentUserId, 'BLOCK_USER', "Blocked user ID: $blockedUserId");
-        
-        echo json_encode(['success' => true, 'message' => 'User wurde blockiert']);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // UNBLOCK USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'unblock_user') {
-        $blockedUserId = intval($_POST['user_id'] ?? 0);
-        
-        if ($blockedUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            DELETE FROM blocks 
-            WHERE blocker_id = :blocker_id 
-            AND blocked_id = :blocked_id
-        ');
-        $stmt->bindValue(':blocker_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':blocked_id', $blockedUserId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent($currentUserId, 'UNBLOCK_USER', "Unblocked user ID: $blockedUserId");
-        
-        echo json_encode(['success' => true, 'message' => 'User wurde entblockt']);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // REPORT USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'report_user') {
-        $reportedUserId = intval($_POST['user_id'] ?? 0);
-        $reason = trim($_POST['reason'] ?? '');
-        $messageId = intval($_POST['message_id'] ?? 0);
-        
-        if ($reportedUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        if (empty($reason)) {
-            echo json_encode(['success' => false, 'error' => 'Bitte gib einen Grund an']);
-            exit;
-        }
-        
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $stmt = $db->prepare('
-            INSERT INTO reports (reporter_id, reported_user_id, reason, message_id)
-            VALUES (:reporter_id, :reported_user_id, :reason, :message_id)
-        ');
-        $stmt->bindValue(':reporter_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':reported_user_id', $reportedUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
-        $stmt->bindValue(':message_id', $messageId > 0 ? $messageId : null, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        logSecurityEvent($currentUserId, 'REPORT_USER', "Reported user ID: $reportedUserId, Reason: $reason");
-        
-        // Auto-flag if multiple reports
-        $stmt = $db->prepare('
-            SELECT COUNT(*) as count 
-            FROM reports 
-            WHERE reported_user_id = :reported_user_id 
-            AND status = "pending"
-        ');
-        $stmt->bindValue(':reported_user_id', $reportedUserId, SQLITE3_INTEGER);
-        $result = $stmt->execute();
-        $row = $result->fetchArray(SQLITE3_ASSOC);
-        
-        if ($row['count'] >= 3) {
-            // Auto-ban after 3 reports
-            $stmt = $db->prepare('
-                UPDATE users 
-                SET is_banned = 1, ban_reason = "Mehrfache Meldungen" 
-                WHERE id = :user_id
-            ');
-            $stmt->bindValue(':user_id', $reportedUserId, SQLITE3_INTEGER);
-            $stmt->execute();
-            
-            logSecurityEvent($reportedUserId, 'AUTO_BAN', "3+ reports");
-        }
-        
-        echo json_encode(['success' => true, 'message' => 'Meldung wurde gespeichert. Danke!']);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // GET BLOCKED USERS
-    // ───────────────────────────────────────────────────────
-    if ($action === 'get_blocked_users') {
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        
-        $query = '
-            SELECT 
-                u.id,
-                u.username,
-                u.user_id as display_id,
-                b.timestamp as blocked_at
-            FROM blocks b
-            JOIN users u ON b.blocked_id = u.id
-            WHERE b.blocker_id = :current_user_id
-            ORDER BY b.timestamp DESC
-        ';
-        
-        $stmt = $db->prepare($query);
-        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-        $result = $stmt->execute();
-        
-        $blocked = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $blocked[] = [
-                'id' => $row['id'],
-                'username' => $row['username'],
-                'display_name' => $row['username'] . '#' . $row['display_id'],
-                'blocked_at' => $row['blocked_at']
-            ];
-        }
-        
-        echo json_encode(['success' => true, 'blocked_users' => $blocked]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // ADMIN: GET REPORTS
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_get_reports') {
-        if (!isAdmin()) {
-            echo json_encode(['success' => false, 'error' => 'Keine Berechtigung']);
-            exit;
-        }
-        
-        $db = getDB();
-        
-        $query = '
-            SELECT 
-                r.id,
-                r.reason,
-                r.timestamp,
-                r.status,
-                u1.username as reporter_username,
-                u1.user_id as reporter_display_id,
-                u2.username as reported_username,
-                u2.user_id as reported_display_id,
-                u2.id as reported_user_id,
-                m.message as message_content
-            FROM reports r
-            JOIN users u1 ON r.reporter_id = u1.id
-            JOIN users u2 ON r.reported_user_id = u2.id
-            LEFT JOIN messages m ON r.message_id = m.id
-            WHERE r.status = "pending"
-            ORDER BY r.timestamp DESC
-        ';
-        
-        $result = $db->query($query);
-        
-        $reports = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $reports[] = [
-                'id' => $row['id'],
-                'reason' => $row['reason'],
-                'timestamp' => $row['timestamp'],
-                'reporter' => $row['reporter_username'] . '#' . $row['reporter_display_id'],
-                'reported_user' => $row['reported_username'] . '#' . $row['reported_display_id'],
-                'reported_user_id' => $row['reported_user_id'],
-                'message_content' => $row['message_content']
-            ];
-        }
-        
-        echo json_encode(['success' => true, 'reports' => $reports]);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // ADMIN: BAN USER
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_ban_user') {
-        if (!isAdmin()) {
-            echo json_encode(['success' => false, 'error' => 'Keine Berechtigung']);
-            exit;
-        }
-        
-        $userId = intval($_POST['user_id'] ?? 0);
-        $reason = trim($_POST['reason'] ?? 'Verstoß gegen Nutzungsbedingungen');
-        
-        if ($userId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        
-        $stmt = $db->prepare('
-            UPDATE users 
-            SET is_banned = 1, ban_reason = :reason 
-            WHERE id = :user_id
-        ');
-        $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
-        $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
-        $stmt->execute();
-        
-        logSecurityEvent($userId, 'ADMIN_BAN', "Reason: $reason, Admin: " . $_SESSION['admin_username']);
-        
-        echo json_encode(['success' => true, 'message' => 'User wurde gesperrt']);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // ADMIN: RESOLVE REPORT
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_resolve_report') {
-        if (!isAdmin()) {
-            echo json_encode(['success' => false, 'error' => 'Keine Berechtigung']);
-            exit;
-        }
-        
-        $reportId = intval($_POST['report_id'] ?? 0);
-        
-        if ($reportId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige Report-ID']);
-            exit;
-        }
-        
-        $db = getDB();
-        
-        $stmt = $db->prepare('UPDATE reports SET status = "resolved" WHERE id = :report_id');
-        $stmt->bindValue(':report_id', $reportId, SQLITE3_INTEGER);
-        $stmt->execute();
-        
-        echo json_encode(['success' => true, 'message' => 'Meldung wurde bearbeitet']);
-        exit;
-    }
-    
-    // ───────────────────────────────────────────────────────
-    // ADMIN: GET STATS
-    // ───────────────────────────────────────────────────────
-    if ($action === 'admin_get_stats') {
-        if (!isAdmin()) {
-            echo json_encode(['success' => false, 'error' => 'Keine Berechtigung']);
-            exit;
-        }
-        
-        $db = getDB();
-        
-        // Total users
-        $result = $db->query('SELECT COUNT(*) as count FROM users');
-        $totalUsers = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Online users
-        $result = $db->query("
-            SELECT COUNT(*) as count 
-            FROM online_status 
-            WHERE (julianday('now') - julianday(last_ping)) * 86400 < " . ONLINE_TIMEOUT_SECONDS
-        );
-        $onlineUsers = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Pending reports
-        $result = $db->query('SELECT COUNT(*) as count FROM reports WHERE status = "pending"');
-        $pendingReports = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Messages today
-        $result = $db->query("SELECT COUNT(*) as count FROM messages WHERE timestamp > datetime('now', '-1 day')");
-        $messagesToday = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Banned users
-        $result = $db->query('SELECT COUNT(*) as count FROM users WHERE is_banned = 1');
-        $bannedUsers = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        // Blocked keywords today
-        $result = $db->query("
-            SELECT COUNT(*) as count 
-            FROM security_logs 
-            WHERE action = 'KEYWORD_BLOCKED' 
-            AND timestamp > datetime('now', '-1 day')
-        ");
-        $blockedKeywords = $result->fetchArray(SQLITE3_ASSOC)['count'];
-        
-        echo json_encode([
-            'success' => true,
-            'stats' => [
-                'total_users' => $totalUsers,
-                'online_users' => $onlineUsers,
-                'pending_reports' => $pendingReports,
-                'messages_today' => $messagesToday,
-                'banned_users' => $bannedUsers,
-                'blocked_keywords_today' => $blockedKeywords
-            ]
-        ]);
-        exit;
-    }
-    
-    echo json_encode(['success' => false, 'error' => 'Unbekannte Aktion']);
-    exit;
-}
-
-// ═══════════════════════════════════════════════════════════
-// SSE STREAM (ECHTZEIT)
-// ═══════════════════════════════════════════════════════════
-
-if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
-    if (!isLoggedIn()) {
-        exit;
-    }
-    
-    header('Content-Type: text/event-stream');
-    header('Cache-Control: no-cache');
-    header('Connection: keep-alive');
-    header('X-Accel-Buffering: no');
-    
-    $currentUserId = getCurrentUserId();
-    $lastMessageId = intval($_GET['last_message_id'] ?? 0);
-    
-    set_time_limit(0);
-    ob_implicit_flush(true);
-    ob_end_flush();
-    
-    $db = getDB();
-    
-    $stmt = $db->prepare('
-        SELECT 
-            m.id,
-            m.from_user_id,
-            m.to_user_id,
-            m.message,
-            m.timestamp,
-            u.username as from_username,
-            u.user_id as from_display_id
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.id > :last_message_id
-        AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
-        ORDER BY m.id ASC
-    ');
-    $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
-    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $messages = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $messages[] = $row;
-    }
-    
-    if (!empty($messages)) {
-        echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
-        flush();
-    } else {
-        echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
-        flush();
-    }
-    
-    exit;
-}
-
-// ═══════════════════════════════════════════════════════════
-// HTML STARTS HERE
-// ═══════════════════════════════════════════════════════════
-?>
-<!DOCTYPE html>
-<html lang="de">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>💬 Secure Private Chat</title>
     
     <style>
@@ -2694,10 +1469,23 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             padding: 0;
             box-sizing: border-box;
         }
-        
+
+        :root {
+            --sun-900: #8c5e00;
+            --sun-700: #b77900;
+            --sun-600: #d18c00;
+            --sun-500: #f0b400;
+            --sun-400: #ffd046;
+            --sun-200: #ffe7a3;
+            --sun-100: #fff2c9;
+            --sun-50: #fff8e6;
+            --text-dark: #3c2a00;
+        }
+
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: radial-gradient(circle at top, var(--sun-400) 0%, var(--sun-700) 45%, var(--sun-900) 100%);
+            color: var(--text-dark);
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -2719,14 +1507,14 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .auth-container h1 {
-            color: #667eea;
+            color: var(--sun-700);
             margin-bottom: 10px;
             font-size: 32px;
             text-align: center;
         }
-        
+
         .auth-container .subtitle {
-            color: #666;
+            color: rgba(60, 42, 0, 0.75);
             margin-bottom: 30px;
             text-align: center;
             font-size: 14px;
@@ -2759,26 +1547,27 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         
         .auth-container label {
             display: block;
-            color: #333;
+            color: var(--text-dark);
             font-weight: 600;
             margin-bottom: 8px;
             font-size: 14px;
         }
-        
+
         .auth-container input[type="text"],
         .auth-container input[type="date"],
         .auth-container input[type="password"] {
             width: 100%;
             padding: 12px 15px;
-            border: 2px solid #e0e0e0;
+            border: 2px solid rgba(188, 118, 0, 0.2);
             border-radius: 10px;
             font-size: 15px;
-            transition: border-color 0.3s;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
-        
+
         .auth-container input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
         }
         
         .auth-container .checkbox-group {
@@ -2817,25 +1606,279 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .auth-container button {
             width: 100%;
             padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
             color: white;
             border: none;
-            border-radius: 10px;
+            border-radius: 12px;
             font-size: 16px;
-            font-weight: bold;
+            font-weight: 600;
             cursor: pointer;
-            transition: transform 0.2s;
+            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
-        
+
         .auth-container button:hover {
             transform: translateY(-2px);
+            box-shadow: 0 16px 28px rgba(188, 118, 0, 0.4);
         }
-        
+
         .auth-container button:disabled {
-            opacity: 0.5;
+            opacity: 0.55;
             cursor: not-allowed;
+            box-shadow: none;
         }
-        
+
+        /* ═══════════════════════════════════════════════════════════ */
+        /* ADMIN VIEWS */
+        /* ═══════════════════════════════════════════════════════════ */
+
+        .admin-login-container {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 450px;
+        }
+
+        .admin-login-container h1 {
+            text-align: center;
+            font-size: 28px;
+            margin-bottom: 10px;
+            color: var(--sun-700);
+        }
+
+        .admin-login-container p {
+            text-align: center;
+            color: #666;
+            margin-bottom: 25px;
+        }
+
+        .admin-login-container .form-group {
+            margin-bottom: 20px;
+        }
+
+        .admin-login-container label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .admin-login-container input {
+            width: 100%;
+            padding: 12px 14px;
+            border-radius: 10px;
+            border: 2px solid rgba(188, 118, 0, 0.2);
+            font-size: 15px;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .admin-login-container input:focus {
+            outline: none;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
+        }
+
+        .admin-login-container button {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .admin-login-container button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 16px 28px rgba(188, 118, 0, 0.4);
+        }
+
+        .admin-login-container .back-link {
+            margin-top: 20px;
+            text-align: center;
+        }
+
+        .admin-login-container .back-link a {
+            color: var(--sun-700);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .admin-login-container .back-link a:hover {
+            color: var(--sun-900);
+            text-decoration: underline;
+        }
+
+        .admin-dashboard {
+            width: 95%;
+            max-width: 1400px;
+            background: var(--sun-50);
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(60, 42, 0, 0.25);
+            padding: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+
+        .admin-dashboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .admin-dashboard-header h1 {
+            font-size: 26px;
+            color: var(--sun-700);
+        }
+
+        .admin-dashboard-header button {
+            padding: 10px 18px;
+            border: none;
+            border-radius: 8px;
+            background: #ef4444;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .admin-dashboard-header button:hover {
+            background: #dc2626;
+        }
+
+        .admin-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+        }
+
+        .admin-stat-card {
+            padding: 20px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
+            color: white;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            box-shadow: 0 12px 30px rgba(188, 118, 0, 0.35);
+        }
+
+        .admin-stat-card span {
+            font-size: 13px;
+            opacity: 0.85;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .admin-stat-card strong {
+            font-size: 28px;
+        }
+
+        .admin-sections {
+            display: grid;
+            gap: 30px;
+        }
+
+        .admin-section {
+            background: rgba(255,255,255,0.9);
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid rgba(188, 118, 0, 0.18);
+        }
+
+        .admin-section h2 {
+            font-size: 18px;
+            margin-bottom: 15px;
+            color: #1f2937;
+        }
+
+        .admin-table-wrapper {
+            overflow-x: auto;
+        }
+
+        .admin-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .admin-table th,
+        .admin-table td {
+            text-align: left;
+            padding: 12px 10px;
+            border-bottom: 1px solid #e5e7eb;
+            vertical-align: top;
+        }
+
+        .admin-table th {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+        }
+
+        .admin-action-buttons {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .admin-action-buttons button {
+            border: none;
+            border-radius: 6px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        .btn-secondary {
+            background: #e5e7eb;
+            color: #111827;
+        }
+
+        .btn-secondary:hover {
+            background: #d1d5db;
+        }
+
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #059669;
+        }
+
+        .admin-empty-state {
+            text-align: center;
+            padding: 20px;
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .admin-error-message {
+            margin-bottom: 15px;
+            color: #dc2626;
+            text-align: center;
+            display: none;
+        }
+
         .error-message {
             background: #fee;
             color: #c33;
@@ -2855,7 +1898,31 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             display: none;
             font-size: 14px;
         }
-        
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 16px 30px rgba(188, 118, 0, 0.4);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
         .admin-link {
             text-align: center;
             margin-top: 20px;
@@ -2863,11 +1930,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .admin-link a {
-            color: #667eea;
+            color: var(--sun-700);
             text-decoration: none;
         }
-        
+
         .admin-link a:hover {
+            color: var(--sun-900);
             text-decoration: underline;
         }
         
@@ -2880,19 +1948,19 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             width: 95%;
             max-width: 1400px;
             height: 90vh;
-            background: white;
+            background: var(--sun-50);
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(60, 42, 0, 0.25);
             overflow: hidden;
             grid-template-columns: 350px 1fr;
-            grid-template-rows: 60px 1fr;
+            grid-template-rows: 70px 1fr;
         }
-        
+
         .chat-header {
             grid-column: 1 / -1;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-900) 100%);
             color: white;
-            padding: 0 20px;
+            padding: 0 24px;
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -2917,119 +1985,137 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .chat-header .age-badge {
-            background: rgba(255,255,255,0.3);
-            padding: 4px 10px;
-            border-radius: 12px;
+            background: rgba(255,255,255,0.28);
+            padding: 4px 12px;
+            border-radius: 16px;
             font-size: 12px;
+            letter-spacing: 0.02em;
         }
-        
+
         .chat-header button {
-            background: rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.25);
             color: white;
             border: none;
-            padding: 8px 16px;
-            border-radius: 5px;
+            padding: 8px 18px;
+            border-radius: 18px;
             cursor: pointer;
-            transition: background 0.3s;
+            transition: background 0.2s ease, transform 0.2s ease;
             font-size: 13px;
+            font-weight: 600;
         }
-        
+
         .chat-header button:hover {
-            background: rgba(255,255,255,0.3);
+            background: rgba(255,255,255,0.35);
+            transform: translateY(-1px);
         }
         
         /* SIDEBAR */
         .sidebar {
-            background: #f5f5f5;
-            border-right: 1px solid #e0e0e0;
+            background: rgba(255,255,255,0.92);
+            border-right: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
             flex-direction: column;
         }
-        
+
         .sidebar-search {
             padding: 15px;
-            background: white;
-            border-bottom: 1px solid #e0e0e0;
+            background: var(--sun-50);
+            border-bottom: 1px solid rgba(188, 118, 0, 0.15);
         }
-        
+
         .sidebar-search input {
             width: 100%;
             padding: 10px 15px;
-            border: 1px solid #e0e0e0;
+            border: 1px solid rgba(188, 118, 0, 0.3);
             border-radius: 20px;
             font-size: 14px;
+            background: white;
+            color: var(--text-dark);
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
-        
+
         .sidebar-search input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.25);
         }
-        
+
         .user-list {
             flex: 1;
             overflow-y: auto;
+            background: transparent;
         }
-        
+
         .user-item {
             padding: 15px 20px;
-            border-bottom: 1px solid #e0e0e0;
+            border: none;
+            border-bottom: 1px solid rgba(188, 118, 0, 0.12);
             cursor: pointer;
-            transition: background 0.2s;
+            transition: background 0.2s ease, transform 0.2s ease;
             display: flex;
             align-items: center;
             gap: 12px;
             position: relative;
+            width: 100%;
+            text-align: left;
+            background: transparent;
+            font: inherit;
         }
-        
-        .user-item:hover {
-            background: #e8e8e8;
+
+        .user-item:hover,
+        .user-item:focus-visible {
+            background: rgba(255, 208, 70, 0.18);
+            outline: none;
         }
-        
+
         .user-item.active {
-            background: #667eea;
-            color: white;
+            background: rgba(255, 208, 70, 0.32);
+            color: var(--text-dark);
+            box-shadow: inset 0 0 0 1px rgba(240, 180, 0, 0.35);
         }
-        
+
         .user-avatar {
             width: 45px;
             height: 45px;
             border-radius: 50%;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-weight: bold;
+            font-weight: 700;
             font-size: 16px;
             flex-shrink: 0;
             position: relative;
+            box-shadow: 0 6px 14px rgba(188, 118, 0, 0.3);
         }
-        
+
         .user-item.active .user-avatar {
             background: white;
-            color: #667eea;
+            color: var(--sun-700);
+            box-shadow: 0 0 0 2px rgba(240, 180, 0, 0.45);
         }
-        
+
         .online-indicator {
             width: 12px;
             height: 12px;
             border-radius: 50%;
-            background: #4caf50;
+            background: #3ac57a;
             border: 2px solid white;
             position: absolute;
             bottom: 0;
             right: 0;
         }
-        
+
         .offline-indicator {
-            background: #999;
+            background: #b5b5b5;
         }
-        
+
         .user-info-text {
             flex: 1;
             min-width: 0;
         }
-        
+
         .user-name {
             font-weight: 600;
             font-size: 14px;
@@ -3038,18 +2124,18 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             overflow: hidden;
             text-overflow: ellipsis;
         }
-        
+
         .user-status {
             font-size: 12px;
-            color: #999;
+            color: rgba(60, 42, 0, 0.55);
         }
-        
+
         .user-item.active .user-status {
-            color: rgba(255,255,255,0.8);
+            color: rgba(60, 42, 0, 0.75);
         }
         
         .unread-badge {
-            background: #f44336;
+            background: var(--sun-700);
             color: white;
             border-radius: 12px;
             padding: 2px 8px;
@@ -3058,149 +2144,238 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             min-width: 20px;
             text-align: center;
         }
-        
+
         /* CHAT AREA */
         .chat-area {
             display: flex;
             flex-direction: column;
-            background: #e5ddd5;
+            background: var(--sun-50);
         }
-        
+
         .chat-welcome {
             flex: 1;
             display: flex;
             align-items: center;
             justify-content: center;
             flex-direction: column;
-            color: #999;
+            color: rgba(60, 42, 0, 0.55);
             font-size: 18px;
+            text-align: center;
+            padding: 0 30px;
         }
-        
+
         .chat-welcome-icon {
             font-size: 80px;
             margin-bottom: 20px;
         }
-        
+
         .chat-messages-container {
             display: none;
             flex-direction: column;
             height: 100%;
+            background: rgba(255,255,255,0.6);
         }
-        
-        .chat-messages-header {
-            background: white;
-            padding: 15px 20px;
-            border-bottom: 1
 
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Nachricht enthält nicht erlaubte Inhalte',
-                'reason' => 'Bitte gib keine persönlichen Daten weiter (Adressen, Telefonnummern, etc.)'
-            ]);
-            exit;
-        }
-                    border-bottom: 1px solid #e0e0e0;
+        .chat-messages-header {
+            background: rgba(255,255,255,0.94);
+            padding: 18px 24px;
+            border-bottom: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
             align-items: center;
             gap: 12px;
         }
-        
+
         .chat-messages {
             flex: 1;
             overflow-y: auto;
-            padding: 20px;
+            padding: 24px;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 12px;
         }
-        
+
         .message {
             max-width: 65%;
-            padding: 10px 15px;
-            border-radius: 10px;
+            padding: 12px 16px;
+            border-radius: 14px;
             word-wrap: break-word;
             animation: slideIn 0.3s ease;
+            box-shadow: 0 6px 16px rgba(60, 42, 0, 0.08);
         }
-        
+
         @keyframes slideIn {
             from { opacity: 0; transform: translateY(10px); }
             to { opacity: 1; transform: translateY(0); }
         }
-        
+
         .message-received {
             align-self: flex-start;
             background: white;
-            border-bottom-left-radius: 2px;
+            border: 1px solid rgba(188, 118, 0, 0.12);
+            border-bottom-left-radius: 4px;
         }
-        
+
         .message-sent {
             align-self: flex-end;
-            background: #dcf8c6;
-            border-bottom-right-radius: 2px;
+            background: var(--sun-200);
+            color: var(--text-dark);
+            border-bottom-right-radius: 4px;
         }
-        
+
         .message-text {
-            margin-bottom: 5px;
-            line-height: 1.4;
+            margin-bottom: 6px;
+            line-height: 1.5;
         }
-        
+
         .message-time {
             font-size: 11px;
-            color: #999;
+            color: rgba(60, 42, 0, 0.55);
             text-align: right;
         }
-        
+
         /* Chat Input */
         .chat-input-container {
-            background: white;
-            padding: 15px 20px;
-            border-top: 1px solid #e0e0e0;
+            background: rgba(255,255,255,0.92);
+            padding: 16px 24px;
+            border-top: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
-            gap: 10px;
+            gap: 12px;
             align-items: center;
         }
-        
+
         .chat-input {
             flex: 1;
-            padding: 12px 15px;
-            border: 1px solid #e0e0e0;
-            border-radius: 25px;
+            padding: 12px 16px;
+            border: 1px solid rgba(188, 118, 0, 0.28);
+            border-radius: 28px;
             font-size: 15px;
             resize: none;
-            max-height: 100px;
+            max-height: 120px;
+            background: white;
+            color: var(--text-dark);
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
-        
+
         .chat-input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
         }
-        
+
         .send-button {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
             color: white;
             border: none;
-            padding: 12px 24px;
-            border-radius: 25px;
+            padding: 12px 28px;
+            border-radius: 28px;
             cursor: pointer;
-            font-weight: bold;
-            transition: transform 0.2s;
+            font-weight: 600;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
         }
-        
+
         .send-button:hover {
             transform: translateY(-2px);
+            box-shadow: 0 16px 28px rgba(188, 118, 0, 0.4);
         }
-        
+
         .send-button:disabled {
-            opacity: 0.5;
+            opacity: 0.55;
             cursor: not-allowed;
+            box-shadow: none;
+        }
+
+        .empty-user-list,
+        .empty-messages,
+        .loading-state,
+        .error-state {
+            text-align: center;
+            padding: 30px 20px;
+            color: rgba(60, 42, 0, 0.6);
+            font-size: 14px;
+        }
+
+        .empty-user-list {
+            padding: 40px 20px;
+        }
+
+        .loading-state {
+            font-style: italic;
+        }
+
+        .error-state {
+            color: #c2410c;
         }
     </style>
 </head>
 <body>
 
-<?php if (!isLoggedIn()): ?>
+<?php if (isAdmin()): ?>
+    <div class="admin-dashboard">
+        <div class="admin-dashboard-header">
+            <h1>🔐 Admin-Dashboard</h1>
+            <button id="adminLogoutBtn">Logout</button>
+        </div>
+
+        <div class="admin-stats-grid" id="adminStatsGrid">
+            <!-- Stats injected via JS -->
+        </div>
+
+        <div class="admin-sections">
+            <div class="admin-section">
+                <div class="admin-section-header">
+                    <h2>🚨 Offene Meldungen</h2>
+                </div>
+                <div id="adminReportsContainer" class="admin-table-wrapper">
+                    <div class="admin-empty-state">Lade Meldungen…</div>
+                </div>
+            </div>
+
+            <div class="admin-section">
+                <h2>🚩 Markierte Nachrichten</h2>
+                <div id="adminFlaggedContainer" class="admin-table-wrapper">
+                    <div class="admin-empty-state">Lade Nachrichten…</div>
+                </div>
+            </div>
+
+            <div class="admin-section">
+                <h2>🚫 Gesperrte Nutzer</h2>
+                <div id="adminBannedContainer" class="admin-table-wrapper">
+                    <div class="admin-empty-state">Lade Nutzer…</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<?php elseif ($isAdminPage): ?>
+    <div class="admin-login-container">
+        <h1>🔐 Admin-Login</h1>
+        <p>Zugriff nur für autorisierte Moderatoren.</p>
+
+        <div class="admin-error-message" id="adminError"></div>
+
+        <form id="adminLoginForm">
+            <div class="form-group">
+                <label for="adminUsername">Benutzername</label>
+                <input type="text" id="adminUsername" autocomplete="username" required>
+            </div>
+
+            <div class="form-group">
+                <label for="adminPassword">Passwort</label>
+                <input type="password" id="adminPassword" autocomplete="current-password" required>
+            </div>
+
+            <button type="submit">Anmelden</button>
+        </form>
+
+        <div class="back-link">
+            <a href="?">Zurück zum Chat</a>
+        </div>
+    </div>
+
+<?php elseif (!isLoggedIn()): ?>
     <!-- REGISTRATION FORM -->
-    <div class="register-container">
+    <div class="auth-container">
         <h1>💬 Secure Private Chat</h1>
         <p class="subtitle">Sicherer Chat mit Altersverifikation</p>
         
@@ -3294,25 +2469,335 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 // JAVASCRIPT
 // ═══════════════════════════════════════════════════════════
 
-<?php if (!isLoggedIn()): ?>
+<?php if (isAdmin()): ?>
+// ADMIN DASHBOARD
+const adminStatsGrid = document.getElementById('adminStatsGrid');
+const adminReportsContainer = document.getElementById('adminReportsContainer');
+const adminFlaggedContainer = document.getElementById('adminFlaggedContainer');
+const adminBannedContainer = document.getElementById('adminBannedContainer');
+
+function adminEscapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text ?? '';
+    return div.innerHTML;
+}
+
+function adminFormatDate(value) {
+    if (!value) return '-';
+    try {
+        return new Date(value).toLocaleString('de-DE');
+    } catch (e) {
+        return value;
+    }
+}
+
+async function adminFetch(action, payload = {}) {
+    const formData = new FormData();
+    formData.append('action', action);
+    Object.entries(payload).forEach(([key, val]) => formData.append(key, val));
+
+    const response = await fetch('', { method: 'POST', body: formData });
+    return response.json();
+}
+
+function renderAdminStats(stats) {
+    if (!stats) {
+        adminStatsGrid.innerHTML = '<div class="admin-empty-state">Keine Statistiken verfügbar.</div>';
+        return;
+    }
+
+    const statItems = [
+        ['Registrierte Nutzer', stats.total_users],
+        ['U18 Nutzer', stats.u18_users],
+        ['Ü18 Nutzer', stats.o18_users],
+        ['Aktiv online', stats.online_users],
+        ['Nachrichten gesamt', stats.total_messages],
+        ['Markierte Nachrichten', stats.flagged_messages],
+        ['Offene Meldungen', stats.pending_reports],
+        ['Gesperrte Nutzer', stats.banned_users]
+    ];
+
+    adminStatsGrid.innerHTML = statItems.map(([label, value]) => `
+        <div class="admin-stat-card">
+            <span>${adminEscapeHtml(label)}</span>
+            <strong>${Number(value) || 0}</strong>
+        </div>
+    `).join('');
+}
+
+function renderReports(reports) {
+    if (!reports || reports.length === 0) {
+        adminReportsContainer.innerHTML = '<div class="admin-empty-state">Aktuell liegen keine offenen Meldungen vor.</div>';
+        return;
+    }
+
+    const rows = reports.map(report => `
+        <tr data-report-id="${report.id}" data-user-id="${report.reported_user_id}">
+            <td>${adminEscapeHtml(report.reporter)}</td>
+            <td>${adminEscapeHtml(report.reported)}</td>
+            <td>
+                <strong>${adminEscapeHtml(report.reason)}</strong>
+                ${report.message ? `<div>${adminEscapeHtml(report.message)}</div>` : ''}
+            </td>
+            <td>${adminEscapeHtml(adminFormatDate(report.timestamp))}</td>
+            <td>
+                <div class="admin-action-buttons">
+                    <button class="btn-danger" data-action="ban" data-user="${report.reported_user_id}">Sperren</button>
+                    <button class="btn-success" data-action="resolve" data-report="${report.id}">Erledigt</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+
+    adminReportsContainer.innerHTML = `
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Melder</th>
+                    <th>Gemeldeter</th>
+                    <th>Grund &amp; Nachricht</th>
+                    <th>Zeitpunkt</th>
+                    <th>Aktionen</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+
+    adminReportsContainer.querySelectorAll('button[data-action="ban"]').forEach(btn => {
+        btn.addEventListener('click', () => adminBanUser(btn.dataset.user));
+    });
+
+    adminReportsContainer.querySelectorAll('button[data-action="resolve"]').forEach(btn => {
+        btn.addEventListener('click', () => adminResolveReport(btn.dataset.report));
+    });
+}
+
+function renderFlagged(flagged) {
+    if (!flagged || flagged.length === 0) {
+        adminFlaggedContainer.innerHTML = '<div class="admin-empty-state">Keine markierten Nachrichten vorhanden.</div>';
+        return;
+    }
+
+    const rows = flagged.map(item => `
+        <tr data-message-id="${item.id}" data-user-id="${item.user_id}">
+            <td>${adminEscapeHtml(item.user)}</td>
+            <td>${adminEscapeHtml(item.message)}</td>
+            <td>${adminEscapeHtml(item.reason)}</td>
+            <td>${adminEscapeHtml(adminFormatDate(item.timestamp))}</td>
+            <td>
+                <div class="admin-action-buttons">
+                    <button class="btn-danger" data-action="ban" data-user="${item.user_id}">Sperren</button>
+                    <button class="btn-secondary" data-action="delete" data-message="${item.id}">Löschen</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+
+    adminFlaggedContainer.innerHTML = `
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Nutzer</th>
+                    <th>Nachricht</th>
+                    <th>Grund</th>
+                    <th>Zeitpunkt</th>
+                    <th>Aktionen</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+
+    adminFlaggedContainer.querySelectorAll('button[data-action="ban"]').forEach(btn => {
+        btn.addEventListener('click', () => adminBanUser(btn.dataset.user));
+    });
+
+    adminFlaggedContainer.querySelectorAll('button[data-action="delete"]').forEach(btn => {
+        btn.addEventListener('click', () => adminDeleteMessage(btn.dataset.message));
+    });
+}
+
+function renderBanned(banned) {
+    if (!banned || banned.length === 0) {
+        adminBannedContainer.innerHTML = '<div class="admin-empty-state">Keine Nutzer gesperrt.</div>';
+        return;
+    }
+
+    const rows = banned.map(user => `
+        <tr data-user-id="${user.id}">
+            <td>${adminEscapeHtml(user.display_name)}</td>
+            <td>${adminEscapeHtml(user.reason)}</td>
+            <td>${adminEscapeHtml(adminFormatDate(user.last_seen))}</td>
+            <td>
+                <div class="admin-action-buttons">
+                    <button class="btn-success" data-action="unban" data-user="${user.id}">Entsperren</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+
+    adminBannedContainer.innerHTML = `
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Nutzer</th>
+                    <th>Grund</th>
+                    <th>Zuletzt aktiv</th>
+                    <th>Aktionen</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+
+    adminBannedContainer.querySelectorAll('button[data-action="unban"]').forEach(btn => {
+        btn.addEventListener('click', () => adminUnbanUser(btn.dataset.user));
+    });
+}
+
+async function loadAdminStats() {
+    const response = await fetch('?action=admin_get_stats');
+    const result = await response.json();
+    if (result.success) {
+        renderAdminStats(result.stats);
+    }
+}
+
+async function loadAdminReports() {
+    const response = await fetch('?action=admin_get_reports');
+    const result = await response.json();
+    if (result.success) {
+        renderReports(result.reports);
+    }
+}
+
+async function loadAdminFlagged() {
+    const response = await fetch('?action=admin_get_flagged');
+    const result = await response.json();
+    if (result.success) {
+        renderFlagged(result.flagged);
+    }
+}
+
+async function loadAdminBanned() {
+    const result = await fetch('?action=admin_get_banned_users');
+    const data = await result.json();
+    if (data.success) {
+        renderBanned(data.banned);
+    }
+}
+
+async function adminBanUser(userId) {
+    const reason = prompt('Grund für die Sperre eingeben:', 'Verstoß gegen Nutzungsbedingungen');
+    if (reason === null) return;
+
+    const result = await adminFetch('admin_ban_user', { user_id: userId, reason });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function adminResolveReport(reportId) {
+    const actionTaken = prompt('Status für Report festlegen (z.B. resolved, dismissed):', 'resolved');
+    if (actionTaken === null) return;
+
+    const result = await adminFetch('admin_resolve_report', { report_id: reportId, action_taken: actionTaken });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function adminDeleteMessage(messageId) {
+    if (!confirm('Markierte Nachricht wirklich löschen?')) return;
+
+    const result = await adminFetch('admin_delete_message', { message_id: messageId });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function adminUnbanUser(userId) {
+    const result = await adminFetch('admin_unban_user', { user_id: userId });
+    if (!result.success) {
+        alert(result.error || 'Aktion fehlgeschlagen');
+        return;
+    }
+    await refreshAdminData();
+}
+
+async function refreshAdminData() {
+    await Promise.all([
+        loadAdminStats(),
+        loadAdminReports(),
+        loadAdminFlagged(),
+        loadAdminBanned()
+    ]);
+}
+
+document.getElementById('adminLogoutBtn').addEventListener('click', async () => {
+    await adminFetch('logout');
+    window.location.href = '?';
+});
+
+refreshAdminData();
+setInterval(refreshAdminData, 30000);
+
+<?php elseif ($isAdminPage): ?>
+// ADMIN LOGIN
+const adminLoginForm = document.getElementById('adminLoginForm');
+const adminError = document.getElementById('adminError');
+
+adminLoginForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    adminError.style.display = 'none';
+
+    const formData = new FormData();
+    formData.append('action', 'admin_login');
+    formData.append('username', document.getElementById('adminUsername').value.trim());
+    formData.append('password', document.getElementById('adminPassword').value);
+
+    try {
+        const response = await fetch('', { method: 'POST', body: formData });
+        const result = await response.json();
+
+        if (result.success) {
+            window.location.href = '?admin=1';
+        } else {
+            adminError.textContent = result.error || 'Anmeldung fehlgeschlagen';
+            adminError.style.display = 'block';
+        }
+    } catch (error) {
+        adminError.textContent = 'Server nicht erreichbar';
+        adminError.style.display = 'block';
+    }
+});
+
+<?php elseif (!isLoggedIn()): ?>
 // REGISTRATION
 document.getElementById('registerForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    
+
     const username = document.getElementById('username').value.trim();
     const birthdate = document.getElementById('birthdate').value;
     const agreedTerms = document.getElementById('agreeTerms').checked;
-    
+
     const formData = new FormData();
     formData.append('action', 'register');
     formData.append('username', username);
     formData.append('birthdate', birthdate);
     formData.append('agreed_terms', agreedTerms);
-    
+
     try {
         const response = await fetch('', { method: 'POST', body: formData });
         const result = await response.json();
-        
+
         if (result.success) {
             window.location.reload();
         } else {
@@ -3337,79 +2822,140 @@ const state = {
     eventSource: null
 };
 
-// Load Users
 async function loadUsers() {
     const response = await fetch('?action=get_users');
     const result = await response.json();
-    
+
     if (result.success) {
         state.users = result.users;
         renderUserList();
     }
 }
 
-// Render User List
 function renderUserList() {
     const userList = document.getElementById('userList');
-    const searchTerm = document.getElementById('userSearch').value.toLowerCase();
-    
-    const filtered = state.users.filter(u => u.display_name.toLowerCase().includes(searchTerm));
-    
-    userList.innerHTML = filtered.map(user => `
-        <div class="user-item ${user.id === state.selectedUserId ? 'active' : ''}" onclick="selectUser(${user.id}, '${user.display_name}')">
-            <div class="user-avatar">
-                ${user.username.charAt(0).toUpperCase()}
-                <div class="online-indicator ${user.is_online ? '' : 'offline-indicator'}"></div>
-            </div>
-            <div class="user-info-text">
-                <div class="user-name">${user.display_name}</div>
-                <div class="user-status">${user.is_online ? 'Online' : 'Offline'}</div>
-            </div>
-            ${user.unread_count > 0 ? `<div class="unread-badge">${user.unread_count}</div>` : ''}
-        </div>
-    `).join('');
+    if (!userList) {
+        return;
+    }
+
+    const searchInput = document.getElementById('userSearch');
+    const searchTerm = (searchInput?.value || '').toLowerCase();
+
+    const filtered = state.users.filter(u => (u.display_name || '').toLowerCase().includes(searchTerm));
+
+    if (filtered.length === 0) {
+        userList.innerHTML = '<div class="empty-user-list">Keine Nutzer gefunden.</div>';
+        return;
+    }
+
+    userList.innerHTML = filtered.map(user => {
+        const displayNameRaw = (user.display_name || user.username || '').trim();
+        const displayName = displayNameRaw.length > 0 ? displayNameRaw : 'Unbekannt';
+        const initial = displayName.charAt(0).toUpperCase() || '?';
+
+        return `
+            <button type="button" class="user-item ${user.id === state.selectedUserId ? 'active' : ''}" data-user-id="${user.id}">
+                <div class="user-avatar">
+                    ${escapeHtml(initial)}
+                    <div class="online-indicator ${user.is_online ? '' : 'offline-indicator'}"></div>
+                </div>
+                <div class="user-info-text">
+                    <div class="user-name">${escapeHtml(displayName)}</div>
+                    <div class="user-status">${user.is_online ? 'Online' : 'Offline'}</div>
+                </div>
+                ${user.unread_count > 0 ? `<div class="unread-badge">${user.unread_count}</div>` : ''}
+            </button>
+        `;
+    }).join('');
+
+    userList.querySelectorAll('.user-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const userId = Number(item.dataset.userId);
+            const user = state.users.find(u => u.id === userId);
+            if (!user) {
+                return;
+            }
+            selectUser(user.id, user.display_name || user.username);
+        });
+    });
 }
 
-// Select User
 function selectUser(userId, displayName) {
     state.selectedUserId = userId;
-    
-    document.getElementById('chatWelcome').style.display = 'none';
-    document.getElementById('chatMessagesContainer').style.display = 'flex';
-    
-    document.getElementById('chatMessagesHeader').innerHTML = `
-        <div class="user-avatar">${displayName.charAt(0).toUpperCase()}</div>
-        <div><div class="user-name">${displayName}</div></div>
-    `;
-    
+
+    const welcome = document.getElementById('chatWelcome');
+    if (welcome) {
+        welcome.style.display = 'none';
+    }
+
+    const container = document.getElementById('chatMessagesContainer');
+    if (container) {
+        container.style.display = 'flex';
+    }
+
+    const safeDisplayName = (displayName || '').trim() || 'Unbekannt';
+    const initial = safeDisplayName.charAt(0).toUpperCase() || '?';
+
+    const header = document.getElementById('chatMessagesHeader');
+    if (header) {
+        header.innerHTML = `
+            <div class="user-avatar">${escapeHtml(initial)}</div>
+            <div><div class="user-name">${escapeHtml(safeDisplayName)}</div></div>
+        `;
+    }
+
+    const messageList = document.getElementById('chatMessages');
+    if (messageList) {
+        messageList.innerHTML = '<div class="loading-state">Nachrichten werden geladen…</div>';
+    }
+
     loadMessages(userId);
     renderUserList();
 }
 
-// Load Messages
 async function loadMessages(userId) {
-    const response = await fetch(`?action=get_messages&user_id=${userId}`);
-    const result = await response.json();
-    
-    if (result.success) {
-        state.messages = result.messages;
-        renderMessages();
-        markAsRead(userId);
-        
-        if (result.messages.length > 0) {
-            state.lastMessageId = Math.max(...result.messages.map(m => m.id));
+    const messageList = document.getElementById('chatMessages');
+
+    try {
+        const response = await fetch(`?action=get_messages&user_id=${userId}`);
+        const result = await response.json();
+
+        if (result.success) {
+            state.messages = result.messages;
+            renderMessages();
+            markAsRead(userId);
+
+            if (result.messages.length > 0) {
+                state.lastMessageId = Math.max(...result.messages.map(m => m.id));
+            }
+        } else if (messageList) {
+            state.messages = [];
+            messageList.innerHTML = `<div class="error-state">${escapeHtml(result.error || 'Nachrichten konnten nicht geladen werden.')}</div>`;
+        }
+    } catch (error) {
+        if (messageList) {
+            state.messages = [];
+            messageList.innerHTML = '<div class="error-state">Verbindung fehlgeschlagen. Bitte versuche es erneut.</div>';
         }
     }
 }
 
-// Render Messages
 function renderMessages() {
     const container = document.getElementById('chatMessages');
-    
+
+    if (!container) {
+        return;
+    }
+
+    if (!state.messages || state.messages.length === 0) {
+        container.innerHTML = '<div class="empty-messages">Noch keine Nachrichten. Starte den Chat!</div>';
+        return;
+    }
+
     container.innerHTML = state.messages.map(msg => {
         const isSent = msg.from_user_id === state.currentUserId;
         const time = new Date(msg.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-        
+
         return `
             <div class="message ${isSent ? 'message-sent' : 'message-received'}">
                 <div class="message-text">${escapeHtml(msg.message)}</div>
@@ -3417,25 +2963,24 @@ function renderMessages() {
             </div>
         `;
     }).join('');
-    
+
     container.scrollTop = container.scrollHeight;
 }
 
-// Send Message
 async function sendMessage() {
     const input = document.getElementById('chatInput');
     const message = input.value.trim();
-    
+
     if (!message || !state.selectedUserId) return;
-    
+
     const formData = new FormData();
     formData.append('action', 'send_message');
     formData.append('to_user_id', state.selectedUserId);
     formData.append('message', message);
-    
+
     const response = await fetch('', { method: 'POST', body: formData });
     const result = await response.json();
-    
+
     if (result.success) {
         input.value = '';
     } else {
@@ -3443,36 +2988,34 @@ async function sendMessage() {
     }
 }
 
-// Mark as Read
 async function markAsRead(userId) {
     const formData = new FormData();
     formData.append('action', 'mark_read');
     formData.append('user_id', userId);
-    
+
     await fetch('', { method: 'POST', body: formData });
     loadUsers();
 }
 
-// SSE
 function startSSE() {
     state.eventSource = new EventSource(`?stream=events&last_message_id=${state.lastMessageId}`);
-    
+
     state.eventSource.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        
+
         if (data.type === 'messages' && data.messages) {
             data.messages.forEach(msg => {
                 if (msg.id > state.lastMessageId) {
                     state.lastMessageId = msg.id;
-                    
-                    if (state.selectedUserId && 
+
+                    if (state.selectedUserId &&
                         ((msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
                          (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId))) {
-                        
+
                         if (!state.messages.find(m => m.id === msg.id)) {
                             state.messages.push(msg);
                             renderMessages();
-                            
+
                             if (msg.to_user_id === state.currentUserId) {
                                 markAsRead(msg.from_user_id);
                             }
@@ -3480,20 +3023,18 @@ function startSSE() {
                     }
                 }
             });
-            
+
             loadUsers();
         }
     };
 }
 
-// Utility
 function escapeHtml(text) {
     const div = document.createElement('div');
-    div.textContent = text;
+    div.textContent = text ?? '';
     return div.innerHTML;
 }
 
-// Event Listeners
 document.getElementById('sendButton').addEventListener('click', sendMessage);
 document.getElementById('chatInput').addEventListener('keypress', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -3509,20 +3050,17 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
     window.location.reload();
 });
 
-// Auto-resize textarea
 document.getElementById('chatInput').addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 100) + 'px';
 });
 
-// Ping every 10s
 setInterval(async () => {
     const formData = new FormData();
     formData.append('action', 'ping');
     await fetch('', { method: 'POST', body: formData });
 }, 10000);
 
-// Init
 loadUsers();
 startSSE();
 setInterval(loadUsers, 30000);
