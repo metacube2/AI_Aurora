@@ -28,7 +28,10 @@ define('DB_FILE', __DIR__ . '/chat_secure.db');
 define('MESSAGE_RETENTION_HOURS', 24);
 define('LOG_RETENTION_MONTHS', 6);
 define('ONLINE_TIMEOUT_SECONDS', 30);
-define('SSE_RETRY_MS', 1000);
+define('SSE_RETRY_MS', 500);
+define('MAX_MESSAGES_PER_FETCH', 200);
+define('MAX_ATTACHMENT_SIZE', 200 * 1024); // 200 KB
+define('UPLOAD_DIR', __DIR__ . '/uploads');
 
 // Rate Limiting
 define('MAX_MESSAGES_PER_MINUTE', 10);
@@ -70,131 +73,174 @@ $PROFANITY_FILTER = [
 // ═══════════════════════════════════════════════════════════
 
 function getDB() {
-    $db = new SQLite3(DB_FILE);
-    $db->busyTimeout(5000);
-    
-    // Users Table (mit Geburtsdatum und User-ID)
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            user_id TEXT UNIQUE NOT NULL,
-            birthdate DATE NOT NULL,
-            age_group TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_banned INTEGER DEFAULT 0,
-            ban_reason TEXT
-        )
-    ');
-    
-    // Messages Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_user_id INTEGER NOT NULL,
-            to_user_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_read INTEGER DEFAULT 0,
-            is_flagged INTEGER DEFAULT 0,
-            flag_reason TEXT,
-            FOREIGN KEY (from_user_id) REFERENCES users(id),
-            FOREIGN KEY (to_user_id) REFERENCES users(id)
-        )
-    ');
-    
-    // Online Status Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS online_status (
-            user_id INTEGER PRIMARY KEY,
-            last_ping DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ');
-    
-    // Reports Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reporter_id INTEGER NOT NULL,
-            reported_user_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            message_id INTEGER,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT "pending",
-            FOREIGN KEY (reporter_id) REFERENCES users(id),
-            FOREIGN KEY (reported_user_id) REFERENCES users(id),
-            FOREIGN KEY (message_id) REFERENCES messages(id)
-        )
-    ');
-    
-    // Blocks Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS blocks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            blocker_id INTEGER NOT NULL,
-            blocked_id INTEGER NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (blocker_id) REFERENCES users(id),
-            FOREIGN KEY (blocked_id) REFERENCES users(id),
-            UNIQUE(blocker_id, blocked_id)
-        )
-    ');
-    
-    // Rate Limiting Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            user_id INTEGER NOT NULL,
-            action_type TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ');
-    
-    // Logs Table (für Behörden)
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS security_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT NOT NULL,
-            details TEXT,
-            ip_address TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ');
-    
-    // Admin Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS admins (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ');
-    
-    // Create default admin if not exists
-    $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
-    $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-    $result = $stmt->execute();
-    $row = $result->fetchArray(SQLITE3_ASSOC);
-    
-    if ($row['count'] == 0) {
-        $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
-        $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-        $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
-        $stmt->execute();
+    static $db = null;
+    static $initialized = false;
+
+    if ($db === null) {
+        if (!is_dir(UPLOAD_DIR)) {
+            @mkdir(UPLOAD_DIR, 0755, true);
+        }
+
+        $db = new SQLite3(DB_FILE);
+        $db->busyTimeout(5000);
     }
-    
-    // Create indexes
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user_id, to_user_id)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
-    
+
+    if (!$initialized) {
+        // Users Table (mit Geburtsdatum und User-ID)
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                user_id TEXT UNIQUE NOT NULL,
+                birthdate DATE NOT NULL,
+                age_group TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_banned INTEGER DEFAULT 0,
+                ban_reason TEXT
+            )
+        ');
+
+        // Messages Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_user_id INTEGER NOT NULL,
+                to_user_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_read INTEGER DEFAULT 0,
+                is_flagged INTEGER DEFAULT 0,
+                flag_reason TEXT,
+                attachment_path TEXT,
+                attachment_type TEXT,
+                attachment_size INTEGER,
+                FOREIGN KEY (from_user_id) REFERENCES users(id),
+                FOREIGN KEY (to_user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Ensure attachment columns exist for older installations
+        $messagesInfo = $db->query('PRAGMA table_info(messages)');
+        $messageColumns = [];
+        while ($column = $messagesInfo->fetchArray(SQLITE3_ASSOC)) {
+            $messageColumns[$column['name']] = true;
+        }
+        if (!isset($messageColumns['attachment_path'])) {
+            $db->exec('ALTER TABLE messages ADD COLUMN attachment_path TEXT');
+        }
+        if (!isset($messageColumns['attachment_type'])) {
+            $db->exec('ALTER TABLE messages ADD COLUMN attachment_type TEXT');
+        }
+        if (!isset($messageColumns['attachment_size'])) {
+            $db->exec('ALTER TABLE messages ADD COLUMN attachment_size INTEGER');
+        }
+
+        // Online Status Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS online_status (
+                user_id INTEGER PRIMARY KEY,
+                last_ping DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // User Sessions Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                user_id INTEGER PRIMARY KEY,
+                session_token TEXT NOT NULL,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Reports Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id INTEGER NOT NULL,
+                reported_user_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                message_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT "pending",
+                FOREIGN KEY (reporter_id) REFERENCES users(id),
+                FOREIGN KEY (reported_user_id) REFERENCES users(id),
+                FOREIGN KEY (message_id) REFERENCES messages(id)
+            )
+        ');
+
+        // Blocks Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                blocker_id INTEGER NOT NULL,
+                blocked_id INTEGER NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (blocker_id) REFERENCES users(id),
+                FOREIGN KEY (blocked_id) REFERENCES users(id),
+                UNIQUE(blocker_id, blocked_id)
+            )
+        ');
+
+        // Rate Limiting Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Logs Table (für Behörden)
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS security_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                details TEXT,
+                ip_address TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Admin Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ');
+
+        // Create default admin if not exists
+        $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
+        $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $row = $result->fetchArray(SQLITE3_ASSOC);
+
+        if ($row['count'] == 0) {
+            $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
+            $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+            $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
+            $stmt->execute();
+        }
+
+        // Create indexes
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user_id, to_user_id)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen)');
+
+        $initialized = true;
+    }
+
     return $db;
 }
 
@@ -371,9 +417,27 @@ function isBlocked($userId, $otherUserId) {
 
 function cleanupOldData() {
     $db = getDB();
-    
+
     // Delete old messages
     $hours = MESSAGE_RETENTION_HOURS;
+    $attachmentResult = $db->query("SELECT attachment_path FROM messages WHERE attachment_path IS NOT NULL AND timestamp < datetime('now', '-{$hours} hours')");
+    while ($attachmentRow = $attachmentResult->fetchArray(SQLITE3_ASSOC)) {
+        $relativePath = $attachmentRow['attachment_path'] ?? '';
+        if (!$relativePath) {
+            continue;
+        }
+
+        $normalizedPath = str_replace('\\', '/', $relativePath);
+        if (strpos($normalizedPath, 'uploads/') !== 0) {
+            continue;
+        }
+
+        $fullPath = __DIR__ . '/' . $normalizedPath;
+        if (is_file($fullPath)) {
+            @unlink($fullPath);
+        }
+    }
+
     $db->exec("DELETE FROM messages WHERE timestamp < datetime('now', '-{$hours} hours')");
     
     // Delete old rate limits
@@ -382,6 +446,9 @@ function cleanupOldData() {
     // Delete old logs (keep 6 months)
     $months = LOG_RETENTION_MONTHS;
     $db->exec("DELETE FROM security_logs WHERE timestamp < datetime('now', '-{$months} months')");
+
+    // Remove stale session placeholders
+    $db->exec("DELETE FROM user_sessions WHERE last_seen < datetime('now', '-5 minutes')");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -424,10 +491,117 @@ function updateOnlineStatus($userId) {
     ');
     $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
     $stmt->execute();
-    
+
     $stmt = $db->prepare('UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = :user_id');
     $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
     $stmt->execute();
+
+    touchUserSession($userId);
+}
+
+function generateSessionToken() {
+    return bin2hex(random_bytes(32));
+}
+
+function startUserSession($userId) {
+    if (!$userId) {
+        return ['allowed' => false, 'error' => 'Ungültige Benutzer-ID'];
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('SELECT session_token, last_seen FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $existing = $result->fetchArray(SQLITE3_ASSOC);
+
+    if ($existing && !empty($existing['last_seen'])) {
+        $secondsSinceLastSeen = time() - strtotime($existing['last_seen']);
+
+        if ($secondsSinceLastSeen < ONLINE_TIMEOUT_SECONDS) {
+            return [
+                'allowed' => false,
+                'error' => 'Du bist bereits auf einem anderen Gerät eingeloggt. Bitte dort zuerst ausloggen oder kurz warten.'
+            ];
+        }
+    }
+
+    $token = generateSessionToken();
+
+    $stmt = $db->prepare('
+        INSERT OR REPLACE INTO user_sessions (user_id, session_token, last_seen)
+        VALUES (:user_id, :token, CURRENT_TIMESTAMP)
+    ');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':token', $token, SQLITE3_TEXT);
+    $stmt->execute();
+
+    $_SESSION['session_token'] = $token;
+
+    return ['allowed' => true, 'token' => $token];
+}
+
+function touchUserSession($userId) {
+    if (!$userId || empty($_SESSION['session_token'])) {
+        return;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('
+        UPDATE user_sessions
+        SET last_seen = CURRENT_TIMESTAMP
+        WHERE user_id = :user_id AND session_token = :token
+    ');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':token', $_SESSION['session_token'], SQLITE3_TEXT);
+    $stmt->execute();
+}
+
+function clearUserSession($userId) {
+    if (!$userId) {
+        return;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('DELETE FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->execute();
+
+    unset($_SESSION['session_token']);
+}
+
+function validateActiveSession() {
+    if (!isLoggedIn()) {
+        return false;
+    }
+
+    $token = $_SESSION['session_token'] ?? null;
+    if (!$token) {
+        return false;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('SELECT session_token, last_seen FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', getCurrentUserId(), SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $session = $result->fetchArray(SQLITE3_ASSOC);
+
+    if (!$session) {
+        return false;
+    }
+
+    if (!hash_equals($session['session_token'], $token)) {
+        return false;
+    }
+
+    if (!empty($session['last_seen'])) {
+        $secondsSinceLastSeen = time() - strtotime($session['last_seen']);
+
+        if ($secondsSinceLastSeen > ONLINE_TIMEOUT_SECONDS * 3) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -512,9 +686,19 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $stmt->bindValue(':birthdate', $birthdate, SQLITE3_TEXT);
         $stmt->bindValue(':age_group', $ageGroup, SQLITE3_TEXT);
         $stmt->execute();
-        
+
         $dbUserId = $db->lastInsertRowID();
-        
+
+        $sessionResult = startUserSession($dbUserId);
+        if (!$sessionResult['allowed']) {
+            logSecurityEvent($dbUserId, 'LOGIN_BLOCKED_DUPLICATE_SESSION', 'REGISTER');
+            echo json_encode([
+                'success' => false,
+                'error' => $sessionResult['error']
+            ]);
+            exit;
+        }
+
         $_SESSION['user_id'] = $dbUserId;
         $_SESSION['username'] = $username;
         $_SESSION['user_display_id'] = $userId;
@@ -567,17 +751,31 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'logout') {
         if (isLoggedIn()) {
-            logSecurityEvent(getCurrentUserId(), 'LOGOUT', '');
+            $currentUserId = getCurrentUserId();
+            logSecurityEvent($currentUserId, 'LOGOUT', '');
+            clearUserSession($currentUserId);
         }
         session_destroy();
         echo json_encode(['success' => true]);
         exit;
     }
-    
+
     // All other actions require login
     if (!isLoggedIn() && !isAdmin()) {
         echo json_encode(['success' => false, 'error' => 'Nicht eingeloggt']);
         exit;
+    }
+
+    if (isLoggedIn() && !isAdmin() && !validateActiveSession()) {
+        $userId = getCurrentUserId();
+        clearUserSession($userId);
+        session_destroy();
+        echo json_encode(['success' => false, 'error' => 'Deine Sitzung ist nicht mehr gültig. Bitte erneut einloggen.']);
+        exit;
+    }
+
+    if (isLoggedIn() && !isAdmin()) {
+        touchUserSession(getCurrentUserId());
     }
     
     // ───────────────────────────────────────────────────────
@@ -714,28 +912,36 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         }
 
         $query = '
-            SELECT
-                m.id,
-                m.from_user_id,
-                m.to_user_id,
-                m.message,
-                m.timestamp,
-                m.is_read,
-                m.is_flagged,
-                u.username as from_username,
-                u.user_id as from_display_id
-            FROM messages m
-            JOIN users u ON m.from_user_id = u.id
-            WHERE 
-                (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
-                OR
-                (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
-            ORDER BY m.timestamp ASC
+            SELECT * FROM (
+                SELECT
+                    m.id,
+                    m.from_user_id,
+                    m.to_user_id,
+                    m.message,
+                    m.timestamp,
+                    m.is_read,
+                    m.is_flagged,
+                    m.attachment_path,
+                    m.attachment_type,
+                    m.attachment_size,
+                    u.username as from_username,
+                    u.user_id as from_display_id
+                FROM messages m
+                JOIN users u ON m.from_user_id = u.id
+                WHERE
+                    (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
+                    OR
+                    (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
+                ORDER BY m.id DESC
+                LIMIT :limit
+            )
+            ORDER BY id ASC
         ';
-        
+
         $stmt = $db->prepare($query);
         $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':other_user_id', $otherUserId, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', MAX_MESSAGES_PER_FETCH, SQLITE3_INTEGER);
         $result = $stmt->execute();
         
         $messages = [];
@@ -748,6 +954,9 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
                 'timestamp' => $row['timestamp'],
                 'is_read' => $row['is_read'],
                 'is_flagged' => $row['is_flagged'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
                 'from_username' => $row['from_username'],
                 'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
             ];
@@ -763,28 +972,81 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     if ($action === 'send_message') {
         $toUserId = intval($_POST['to_user_id'] ?? 0);
         $message = trim($_POST['message'] ?? '');
-        
+        $hasAttachment = isset($_FILES['attachment']) && ($_FILES['attachment']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE;
+
         if ($toUserId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
-        if (empty($message)) {
-            echo json_encode(['success' => false, 'error' => 'Nachricht darf nicht leer sein']);
+
+        if (!$hasAttachment && $message === '') {
+            echo json_encode(['success' => false, 'error' => 'Nachricht oder Bild erforderlich']);
             exit;
         }
-        
+
         if (strlen($message) > 1000) {
             echo json_encode(['success' => false, 'error' => 'Nachricht zu lang (max 1000 Zeichen)']);
             exit;
         }
-        
+
+        $attachmentFile = $hasAttachment ? $_FILES['attachment'] : null;
+        $attachmentMime = null;
+        $attachmentSize = null;
+
+        if ($hasAttachment && $attachmentFile) {
+            if (!is_uploaded_file($attachmentFile['tmp_name'])) {
+                echo json_encode(['success' => false, 'error' => 'Ungültiger Datei-Upload']);
+                exit;
+            }
+
+            if ($attachmentFile['error'] !== UPLOAD_ERR_OK) {
+                echo json_encode(['success' => false, 'error' => 'Bild konnte nicht hochgeladen werden']);
+                exit;
+            }
+
+            if ($attachmentFile['size'] > MAX_ATTACHMENT_SIZE) {
+                echo json_encode(['success' => false, 'error' => 'Bild ist zu groß (max. 200 KB)']);
+                exit;
+            }
+
+            $attachmentSize = (int)$attachmentFile['size'];
+
+            $mime = null;
+            if (function_exists('finfo_open')) {
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                if ($finfo) {
+                    $mime = finfo_file($finfo, $attachmentFile['tmp_name']);
+                    finfo_close($finfo);
+                }
+            }
+            if (!$mime && function_exists('mime_content_type')) {
+                $mime = mime_content_type($attachmentFile['tmp_name']);
+            }
+            if (!$mime && isset($attachmentFile['type'])) {
+                $mime = $attachmentFile['type'];
+            }
+
+            $mime = strtolower((string)$mime);
+            if (!in_array($mime, ['image/jpeg', 'image/pjpeg', 'image/jpg'], true)) {
+                echo json_encode(['success' => false, 'error' => 'Nur JPG-Bilder sind erlaubt']);
+                exit;
+            }
+
+            $imageInfo = @getimagesize($attachmentFile['tmp_name']);
+            if ($imageInfo === false || !in_array($imageInfo[2], [IMAGETYPE_JPEG], true)) {
+                echo json_encode(['success' => false, 'error' => 'Bilddatei konnte nicht verifiziert werden']);
+                exit;
+            }
+
+            $attachmentMime = 'image/jpeg';
+        }
+
         // Check if blocked
         if (isBlocked(getCurrentUserId(), $toUserId)) {
             echo json_encode(['success' => false, 'error' => 'Nachricht kann nicht gesendet werden']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
@@ -812,91 +1074,119 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             echo json_encode(['success' => false, 'error' => $rateLimitCheck['reason']]);
             exit;
         }
-        
-        // Keyword Blacklist
-        $keywordCheck = checkKeywordBlacklist($message);
-        if ($keywordCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
-            echo json_encode([
-                'success' => false,
-                'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
-                'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
-            ]);
-            exit;
+
+        if ($message !== '') {
+            // Keyword Blacklist
+            $keywordCheck = checkKeywordBlacklist($message);
+            if ($keywordCheck['blocked']) {
+                logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
+                    'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
+                ]);
+                exit;
+            }
+
+            // Profanity Filter
+            $profanityCheck = checkProfanityFilter($message);
+            if ($profanityCheck['blocked']) {
+                logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'Deine Nachricht enthält Schimpfwörter',
+                    'details' => 'Bitte verwende eine angemessene Sprache'
+                ]);
+                exit;
+            }
+
+            // Link Filter
+            $linkCheck = checkLinkFilter($message);
+            if ($linkCheck['blocked']) {
+                logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'Links sind nicht erlaubt',
+                    'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
+                ]);
+                exit;
+            }
         }
-        
-        // Profanity Filter
-        $profanityCheck = checkProfanityFilter($message);
-        if ($profanityCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Deine Nachricht enthält Schimpfwörter',
-                'details' => 'Bitte verwende eine angemessene Sprache'
-            ]);
-            exit;
-        }
-        
-        // Link Filter
-        $linkCheck = checkLinkFilter($message);
-        if ($linkCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Links sind nicht erlaubt',
-                'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
-            ]);
-            exit;
-        }
-        
+
         // Auto-Flagging (verdächtige Muster)
         $isFlagged = 0;
         $flagReason = '';
-        
-        // Check for repeated characters (AAAAAAA)
-        if (preg_match('/(.)\1{5,}/', $message)) {
-            $isFlagged = 1;
-            $flagReason = 'Repeated characters';
+
+        if ($message !== '') {
+            if (preg_match('/(.)\1{5,}/', $message)) {
+                $isFlagged = 1;
+                $flagReason = 'Repeated characters';
+            }
+
+            if (strlen($message) > 20 && $message === strtoupper($message)) {
+                $isFlagged = 1;
+                $flagReason = 'All caps';
+            }
+
+            $emojiCount = preg_match_all('/[\x{1F600}-\x{1F64F}]/u', $message);
+            if ($emojiCount > 10) {
+                $isFlagged = 1;
+                $flagReason = 'Excessive emojis';
+            }
         }
-        
-        // Check for all caps (min 20 chars)
-        if (strlen($message) > 20 && $message === strtoupper($message)) {
-            $isFlagged = 1;
-            $flagReason = 'All caps';
+
+        $attachmentPath = null;
+        if ($hasAttachment && $attachmentFile) {
+            $randomName = bin2hex(random_bytes(16)) . '.jpg';
+            $destination = rtrim(UPLOAD_DIR, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $randomName;
+
+            if (!move_uploaded_file($attachmentFile['tmp_name'], $destination)) {
+                echo json_encode(['success' => false, 'error' => 'Bild konnte nicht gespeichert werden']);
+                exit;
+            }
+
+            $attachmentPath = 'uploads/' . $randomName;
         }
-        
-        // Check for excessive emojis
-        $emojiCount = preg_match_all('/[\x{1F600}-\x{1F64F}]/u', $message);
-        if ($emojiCount > 10) {
-            $isFlagged = 1;
-            $flagReason = 'Excessive emojis';
-        }
-        
+
         // Insert message
         $stmt = $db->prepare('
-            INSERT INTO messages (from_user_id, to_user_id, message, is_flagged, flag_reason)
-            VALUES (:from_user_id, :to_user_id, :message, :is_flagged, :flag_reason)
+            INSERT INTO messages (from_user_id, to_user_id, message, is_flagged, flag_reason, attachment_path, attachment_type, attachment_size)
+            VALUES (:from_user_id, :to_user_id, :message, :is_flagged, :flag_reason, :attachment_path, :attachment_type, :attachment_size)
         ');
         $stmt->bindValue(':from_user_id', $currentUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':to_user_id', $toUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':message', $message, SQLITE3_TEXT);
         $stmt->bindValue(':is_flagged', $isFlagged, SQLITE3_INTEGER);
         $stmt->bindValue(':flag_reason', $flagReason, SQLITE3_TEXT);
+        if ($attachmentPath) {
+            $stmt->bindValue(':attachment_path', $attachmentPath, SQLITE3_TEXT);
+            $stmt->bindValue(':attachment_type', $attachmentMime, SQLITE3_TEXT);
+            $stmt->bindValue(':attachment_size', $attachmentSize, SQLITE3_INTEGER);
+        } else {
+            $stmt->bindValue(':attachment_path', null, SQLITE3_NULL);
+            $stmt->bindValue(':attachment_type', null, SQLITE3_NULL);
+            $stmt->bindValue(':attachment_size', null, SQLITE3_NULL);
+        }
         $stmt->execute();
-        
+
         $messageId = $db->lastInsertRowID();
-        
+
         // Log rate limit
         logRateLimit($currentUserId);
-        
+
         if ($isFlagged) {
             logSecurityEvent($currentUserId, 'MESSAGE_FLAGGED', "Reason: $flagReason, Message ID: $messageId");
         }
-        
+
+        if ($attachmentPath) {
+            logSecurityEvent($currentUserId, 'ATTACHMENT_UPLOADED', "Message ID: $messageId, Size: $attachmentSize");
+        }
+
         echo json_encode([
             'success' => true,
             'message_id' => $messageId,
-            'timestamp' => date('Y-m-d H:i:s')
+            'timestamp' => date('Y-m-d H:i:s'),
+            'attachment_url' => $attachmentPath
         ]);
         exit;
     }
@@ -1373,16 +1663,22 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     if (!isLoggedIn()) {
         exit;
     }
-    
+
+    if (!validateActiveSession()) {
+        exit;
+    }
+
     header('Content-Type: text/event-stream');
     header('Cache-Control: no-cache');
     header('Connection: keep-alive');
     header('X-Accel-Buffering: no');
-    
+
     $currentUserId = getCurrentUserId();
     $currentAgeGroup = getCurrentAgeGroup();
     $lastMessageId = intval($_GET['last_message_id'] ?? 0);
-    
+
+    touchUserSession($currentUserId);
+
     set_time_limit(0);
     ob_implicit_flush(true);
     while (ob_get_level() > 0) {
@@ -1395,17 +1691,20 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     
     $db = getDB();
     
-    $stmt = $db->prepare('
-        SELECT
-            m.id,
-            m.from_user_id,
-            m.to_user_id,
-            m.message,
-            m.timestamp,
-            uf.username as from_username,
-            uf.user_id as from_display_id,
-            uf.age_group as from_age_group,
-            ut.age_group as to_age_group
+        $stmt = $db->prepare('
+            SELECT
+                m.id,
+                m.from_user_id,
+                m.to_user_id,
+                m.message,
+                m.timestamp,
+                m.attachment_path,
+                m.attachment_type,
+                m.attachment_size,
+                uf.username as from_username,
+                uf.user_id as from_display_id,
+                uf.age_group as from_age_group,
+                ut.age_group as to_age_group
         FROM messages m
         JOIN users uf ON m.from_user_id = uf.id
         JOIN users ut ON m.to_user_id = ut.id
@@ -1436,6 +1735,9 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             'to_user_id' => $row['to_user_id'],
             'message' => $row['message'],
             'timestamp' => $row['timestamp'],
+            'attachment_url' => $row['attachment_path'] ?: null,
+            'attachment_type' => $row['attachment_type'] ?: null,
+            'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
             'from_username' => $row['from_username'],
             'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
         ];
@@ -1461,6 +1763,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f59e0b">
     <title>💬 Secure Private Chat</title>
     
     <style>
@@ -1470,14 +1773,31 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             box-sizing: border-box;
         }
         
+        :root {
+            --sun-50: #fff9db;
+            --sun-100: #fef3c7;
+            --sun-200: #fde68a;
+            --sun-300: #fcd34d;
+            --sun-400: #fbbf24;
+            --sun-500: #f59e0b;
+            --sun-600: #d97706;
+            --sun-700: #b45309;
+            --sun-800: #92400e;
+            --sun-900: #78350f;
+            --text-dark: #3d2c00;
+            --text-muted: rgba(61, 44, 0, 0.7);
+        }
+
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #fef08a 0%, #f97316 100%);
+            background-color: #fff9db;
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
             padding: 20px;
+            color: var(--text-dark);
         }
         
         /* ═══════════════════════════════════════════════════════════ */
@@ -1485,7 +1805,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         /* ═══════════════════════════════════════════════════════════ */
         
         .auth-container {
-            background: white;
+            background: #fff9db;
             padding: 40px;
             border-radius: 20px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
@@ -1494,35 +1814,35 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .auth-container h1 {
-            color: #667eea;
+            color: #d97706;
             margin-bottom: 10px;
             font-size: 32px;
             text-align: center;
         }
         
         .auth-container .subtitle {
-            color: #666;
+            color: #7c4a03;
             margin-bottom: 30px;
             text-align: center;
             font-size: 14px;
         }
         
         .auth-container .warning-box {
-            background: #fff3cd;
-            border: 2px solid #ffc107;
+            background: #fef3c7;
+            border: 2px solid #fbbf24;
             border-radius: 10px;
             padding: 15px;
             margin-bottom: 20px;
         }
         
         .auth-container .warning-box h3 {
-            color: #856404;
+            color: #a16207;
             margin-bottom: 10px;
             font-size: 16px;
         }
         
         .auth-container .warning-box ul {
-            color: #856404;
+            color: #a16207;
             margin-left: 20px;
             font-size: 13px;
             line-height: 1.6;
@@ -1534,7 +1854,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         
         .auth-container label {
             display: block;
-            color: #333;
+            color: #7c4a03;
             font-weight: 600;
             margin-bottom: 8px;
             font-size: 14px;
@@ -1545,15 +1865,16 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .auth-container input[type="password"] {
             width: 100%;
             padding: 12px 15px;
-            border: 2px solid #e0e0e0;
+            border: 2px solid #fde68a;
             border-radius: 10px;
             font-size: 15px;
-            transition: border-color 0.3s;
+            transition: border-color 0.3s, box-shadow 0.3s;
         }
         
         .auth-container input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #f59e0b;
+            box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25);
         }
         
         .auth-container .checkbox-group {
@@ -1579,11 +1900,11 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         
         .auth-container .terms-text {
             font-size: 12px;
-            color: #666;
+            color: #7c4a03;
             line-height: 1.6;
             margin-top: 10px;
             padding: 10px;
-            background: #f8f9fa;
+            background: #fff4cc;
             border-radius: 5px;
             max-height: 150px;
             overflow-y: auto;
@@ -1592,18 +1913,19 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .auth-container button {
             width: 100%;
             padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, #fbbf24 0%, #f97316 100%);
+            color: #3d2c00;
             border: none;
             border-radius: 10px;
             font-size: 16px;
             font-weight: bold;
             cursor: pointer;
-            transition: transform 0.2s;
+            transition: transform 0.2s, box-shadow 0.2s;
         }
         
         .auth-container button:hover {
             transform: translateY(-2px);
+            box-shadow: 0 12px 24px rgba(249, 115, 22, 0.25);
         }
         
         .auth-container button:disabled {
@@ -1616,24 +1938,25 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         /* ═══════════════════════════════════════════════════════════ */
 
         .admin-login-container {
-            background: white;
+            background: var(--sun-50);
             padding: 40px;
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(120, 53, 15, 0.25);
             width: 100%;
             max-width: 450px;
+            color: var(--text-dark);
         }
 
         .admin-login-container h1 {
             text-align: center;
             font-size: 28px;
             margin-bottom: 10px;
-            color: #4c51bf;
+            color: var(--sun-800);
         }
 
         .admin-login-container p {
             text-align: center;
-            color: #666;
+            color: var(--text-muted);
             margin-bottom: 25px;
         }
 
@@ -1645,21 +1968,22 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             display: block;
             margin-bottom: 6px;
             font-weight: 600;
-            color: #333;
+            color: var(--sun-800);
         }
 
         .admin-login-container input {
             width: 100%;
             padding: 12px 14px;
             border-radius: 10px;
-            border: 2px solid #e0e0e0;
+            border: 2px solid var(--sun-200);
             font-size: 15px;
-            transition: border-color 0.2s ease;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
 
         .admin-login-container input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.2);
         }
 
         .admin-login-container button {
@@ -1667,16 +1991,17 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             padding: 14px;
             border: none;
             border-radius: 10px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, var(--sun-400) 0%, var(--sun-600) 100%);
+            color: var(--text-dark);
             font-size: 16px;
             font-weight: bold;
             cursor: pointer;
-            transition: transform 0.2s ease;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
 
         .admin-login-container button:hover {
             transform: translateY(-2px);
+            box-shadow: 0 12px 24px rgba(217, 119, 6, 0.28);
         }
 
         .admin-login-container .back-link {
@@ -1685,7 +2010,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
 
         .admin-login-container .back-link a {
-            color: #667eea;
+            color: var(--sun-700);
             text-decoration: none;
             font-weight: 600;
         }
@@ -1697,13 +2022,14 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .admin-dashboard {
             width: 95%;
             max-width: 1400px;
-            background: white;
+            background: var(--sun-50);
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(120, 53, 15, 0.25);
             padding: 30px;
             display: flex;
             flex-direction: column;
             gap: 30px;
+            color: var(--text-dark);
         }
 
         .admin-dashboard-header {
@@ -1715,21 +2041,24 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 
         .admin-dashboard-header h1 {
             font-size: 26px;
-            color: #4c51bf;
+            color: var(--sun-800);
         }
 
         .admin-dashboard-header button {
             padding: 10px 18px;
             border: none;
             border-radius: 8px;
-            background: #ef4444;
+            background: linear-gradient(135deg, #f87171 0%, #ef4444 100%);
             color: white;
             font-weight: 600;
             cursor: pointer;
+            box-shadow: 0 10px 24px rgba(239, 68, 68, 0.35);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
 
         .admin-dashboard-header button:hover {
-            background: #dc2626;
+            transform: translateY(-1px);
+            box-shadow: 0 12px 28px rgba(220, 38, 38, 0.4);
         }
 
         .admin-stats-grid {
@@ -1741,12 +2070,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .admin-stat-card {
             padding: 20px;
             border-radius: 16px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, var(--sun-400) 0%, var(--sun-700) 100%);
+            color: var(--text-dark);
             display: flex;
             flex-direction: column;
             gap: 6px;
-            box-shadow: 0 12px 30px rgba(102, 126, 234, 0.35);
+            box-shadow: 0 12px 30px rgba(250, 204, 21, 0.35);
         }
 
         .admin-stat-card span {
@@ -1766,16 +2095,17 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
 
         .admin-section {
-            background: #f9fafb;
+            background: rgba(255, 255, 255, 0.9);
             border-radius: 16px;
             padding: 20px;
-            border: 1px solid #e5e7eb;
+            border: 1px solid rgba(180, 83, 9, 0.2);
+            box-shadow: inset 0 0 0 1px rgba(255, 200, 92, 0.25);
         }
 
         .admin-section h2 {
             font-size: 18px;
             margin-bottom: 15px;
-            color: #1f2937;
+            color: var(--sun-700);
         }
 
         .admin-table-wrapper {
@@ -1799,7 +2129,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             font-size: 13px;
             text-transform: uppercase;
             letter-spacing: 0.05em;
-            color: #6b7280;
+            color: var(--sun-700);
         }
 
         .admin-action-buttons {
@@ -2219,11 +2549,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             border-top: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
             gap: 12px;
-            align-items: center;
+            align-items: flex-end;
+            flex-wrap: wrap;
         }
 
         .chat-input {
-            flex: 1;
+            flex: 1 1 auto;
             padding: 12px 16px;
             border: 1px solid rgba(188, 118, 0, 0.28);
             border-radius: 28px;
@@ -2239,6 +2570,54 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             outline: none;
             border-color: var(--sun-600);
             box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
+        }
+
+        .chat-input-tools {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .attach-button {
+            background: white;
+            border: 1px dashed rgba(240, 180, 0, 0.6);
+            color: var(--sun-700);
+            padding: 10px 16px;
+            border-radius: 24px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+        }
+
+        .attach-button:hover {
+            transform: translateY(-1px);
+            border-color: var(--sun-700);
+            box-shadow: 0 10px 18px rgba(240, 180, 0, 0.18);
+        }
+
+        .attachment-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(251, 191, 36, 0.18);
+            border: 1px solid rgba(240, 180, 0, 0.35);
+            border-radius: 20px;
+            padding: 6px 12px;
+            font-size: 13px;
+            color: var(--sun-800);
+        }
+
+        .attachment-remove {
+            background: none;
+            border: none;
+            color: #b91c1c;
+            font-size: 14px;
+            cursor: pointer;
+            padding: 0;
+        }
+
+        .attachment-remove:hover {
+            color: #7f1d1d;
         }
 
         .send-button {
@@ -2264,10 +2643,35 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             box-shadow: none;
         }
 
+        .attachment-warning {
+            margin: 0 24px 12px;
+            color: #b91c1c;
+            font-size: 13px;
+        }
+
+        .message-attachment {
+            margin-top: 6px;
+        }
+
+        .message-attachment a {
+            display: inline-block;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 6px 18px rgba(60, 42, 0, 0.22);
+            background: rgba(255, 255, 255, 0.85);
+        }
+
+        .message-attachment img {
+            display: block;
+            max-width: 220px;
+            height: auto;
+        }
+
         .empty-user-list,
         .empty-messages,
         .loading-state,
-        .error-state {
+        .error-state,
+        .chat-state-message {
             text-align: center;
             padding: 30px 20px;
             color: rgba(60, 42, 0, 0.6);
@@ -2284,6 +2688,22 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 
         .error-state {
             color: #c2410c;
+        }
+
+        .chat-state-message.hidden {
+            display: none;
+        }
+
+        .chat-state-message.loading-state {
+            font-style: italic;
+        }
+
+        .chat-state-message.error-state {
+            color: #c2410c;
+        }
+
+        .hidden {
+            display: none !important;
         }
     </style>
 </head>
@@ -2430,14 +2850,24 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                     <!-- Populated via JS -->
                 </div>
                 
+                <div class="chat-state-message hidden" id="chatStateMessage"></div>
                 <div class="chat-messages" id="chatMessages">
                     <!-- Messages loaded via JS -->
                 </div>
                 
                 <div class="chat-input-container">
+                    <div class="chat-input-tools">
+                        <button type="button" class="attach-button" id="attachmentButton" title="Bild anhängen">📎 Bild</button>
+                        <input type="file" id="attachmentInput" accept="image/jpeg" class="hidden" />
+                        <div class="attachment-info hidden" id="attachmentInfo">
+                            <span id="attachmentFileName"></span>
+                            <button type="button" class="attachment-remove" id="attachmentClearBtn" aria-label="Anhang entfernen">✕</button>
+                        </div>
+                    </div>
                     <textarea class="chat-input" id="chatInput" placeholder="Nachricht schreiben..." rows="1" maxlength="1000"></textarea>
                     <button class="send-button" id="sendButton">Senden</button>
                 </div>
+                <div class="attachment-warning hidden" id="attachmentWarning"></div>
             </div>
         </div>
     </div>
@@ -2798,106 +3228,428 @@ const state = {
     users: [],
     messages: [],
     lastMessageId: 0,
-    eventSource: null
+    eventSource: null,
+    isLoadingUsers: false,
+    isLoadingMessages: false,
+    connectionErrorShown: false
 };
 
-async function loadUsers() {
-    const response = await fetch('?action=get_users');
-    const result = await response.json();
+const userListEl = document.getElementById('userList');
+const userSearchInput = document.getElementById('userSearch');
+const chatWelcomeEl = document.getElementById('chatWelcome');
+const chatMessagesContainerEl = document.getElementById('chatMessagesContainer');
+const chatMessagesEl = document.getElementById('chatMessages');
+const chatStateMessageEl = document.getElementById('chatStateMessage');
+const chatMessagesHeaderEl = document.getElementById('chatMessagesHeader');
+const chatInputEl = document.getElementById('chatInput');
+const sendButtonEl = document.getElementById('sendButton');
+const attachmentButtonEl = document.getElementById('attachmentButton');
+const attachmentInputEl = document.getElementById('attachmentInput');
+const attachmentInfoEl = document.getElementById('attachmentInfo');
+const attachmentFileNameEl = document.getElementById('attachmentFileName');
+const attachmentClearBtnEl = document.getElementById('attachmentClearBtn');
+const attachmentWarningEl = document.getElementById('attachmentWarning');
+const ATTACHMENT_MAX_SIZE = 200 * 1024;
+let messageAbortController = null;
 
-    if (result.success) {
-        state.users = result.users;
+async function loadUsers() {
+    if (!userListEl) {
+        return;
+    }
+
+    state.isLoadingUsers = true;
+    renderUserList();
+
+    try {
+        const response = await fetch('?action=get_users');
+        if (!response.ok) {
+            throw new Error('NETZWERK_FEHLER');
+        }
+
+        const result = await response.json();
+
+        if (result.success) {
+            state.users = Array.isArray(result.users) ? result.users : [];
+        } else {
+            throw new Error(result.error || 'Nutzerliste konnte nicht geladen werden.');
+        }
+
+        state.isLoadingUsers = false;
         renderUserList();
+    } catch (error) {
+        console.error('Nutzerliste konnte nicht geladen werden:', error);
+        state.isLoadingUsers = false;
+        if (userListEl) {
+            userListEl.innerHTML = '<div class="error-state">Nutzerliste konnte nicht geladen werden.</div>';
+        }
     }
 }
 
 function renderUserList() {
-    const userList = document.getElementById('userList');
-    const searchTerm = document.getElementById('userSearch').value.toLowerCase();
+    if (!userListEl) {
+        return;
+    }
 
-    const filtered = state.users.filter(u => u.display_name.toLowerCase().includes(searchTerm));
+    const searchTerm = (userSearchInput?.value || '').toLowerCase();
+    const users = Array.isArray(state.users) ? state.users : [];
 
-    userList.innerHTML = filtered.map(user => `
-        <div class="user-item ${user.id === state.selectedUserId ? 'active' : ''}" onclick="selectUser(${user.id}, '${user.display_name}')">
-            <div class="user-avatar">
-                ${user.username.charAt(0).toUpperCase()}
-                <div class="online-indicator ${user.is_online ? '' : 'offline-indicator'}"></div>
-            </div>
-            <div class="user-info-text">
-                <div class="user-name">${user.display_name}</div>
-                <div class="user-status">${user.is_online ? 'Online' : 'Offline'}</div>
-            </div>
-            ${user.unread_count > 0 ? `<div class="unread-badge">${user.unread_count}</div>` : ''}
-        </div>
-    `).join('');
+    if (state.isLoadingUsers && users.length === 0) {
+        userListEl.innerHTML = '<div class="loading-state">Nutzer werden geladen…</div>';
+        return;
+    }
+
+    if (users.length === 0) {
+        userListEl.innerHTML = '<div class="empty-user-list">Noch keine passenden Kontakte verfügbar.</div>';
+        return;
+    }
+
+    const filtered = users.filter(user => user.display_name.toLowerCase().includes(searchTerm));
+
+    if (filtered.length === 0) {
+        userListEl.innerHTML = '<div class="empty-user-list">Keine Treffer für deine Suche.</div>';
+        return;
+    }
+
+    const offlineLimit = 5;
+    const onlineUsers = [];
+    const offlineUsers = [];
+
+    filtered.forEach(user => {
+        if (user.is_online) {
+            onlineUsers.push(user);
+        } else {
+            offlineUsers.push(user);
+        }
+    });
+
+    const limitedUsers = onlineUsers.concat(offlineUsers.slice(0, offlineLimit));
+
+    const fragment = document.createDocumentFragment();
+
+    limitedUsers.forEach(user => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'user-item' + (Number(user.id) === Number(state.selectedUserId) ? ' active' : '');
+        item.dataset.userId = String(user.id);
+        item.dataset.displayName = user.display_name;
+
+        const avatar = document.createElement('div');
+        avatar.className = 'user-avatar';
+        avatar.textContent = (user.username || '?').charAt(0).toUpperCase();
+
+        const indicator = document.createElement('div');
+        indicator.className = 'online-indicator' + (user.is_online ? '' : ' offline-indicator');
+        avatar.appendChild(indicator);
+
+        const infoWrapper = document.createElement('div');
+        infoWrapper.className = 'user-info-text';
+
+        const name = document.createElement('div');
+        name.className = 'user-name';
+        name.textContent = user.display_name;
+
+        const status = document.createElement('div');
+        status.className = 'user-status';
+        status.textContent = user.is_online ? 'Online' : 'Offline';
+
+        infoWrapper.appendChild(name);
+        infoWrapper.appendChild(status);
+
+        item.appendChild(avatar);
+        item.appendChild(infoWrapper);
+
+        if (Number(user.unread_count) > 0) {
+            const unread = document.createElement('div');
+            unread.className = 'unread-badge';
+            unread.textContent = String(user.unread_count);
+            item.appendChild(unread);
+        }
+
+        item.addEventListener('click', () => {
+            selectUser(Number(user.id), user.display_name);
+        });
+
+        fragment.appendChild(item);
+    });
+
+    userListEl.innerHTML = '';
+    userListEl.appendChild(fragment);
+
+    if (offlineUsers.length > offlineLimit) {
+        const hint = document.createElement('div');
+        hint.className = 'user-status';
+        hint.style.textAlign = 'center';
+        hint.style.marginTop = '12px';
+        hint.textContent = 'Weitere Offline-Nutzer werden ausgeblendet.';
+        userListEl.appendChild(hint);
+    }
+}
+
+function renderChatHeader(displayName) {
+    if (!chatMessagesHeaderEl) {
+        return;
+    }
+
+    chatMessagesHeaderEl.innerHTML = '';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'user-avatar';
+    const initial = (displayName?.trim() || '?').charAt(0).toUpperCase();
+    avatar.textContent = initial || '?';
+
+    const info = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'user-name';
+    name.textContent = displayName;
+    info.appendChild(name);
+
+    chatMessagesHeaderEl.appendChild(avatar);
+    chatMessagesHeaderEl.appendChild(info);
+}
+
+function updateChatState(type, message = '') {
+    if (!chatStateMessageEl || !chatMessagesEl) {
+        return;
+    }
+
+    chatStateMessageEl.className = 'chat-state-message';
+
+    if (!type) {
+        chatStateMessageEl.textContent = '';
+        chatStateMessageEl.classList.add('hidden');
+        chatMessagesEl.classList.remove('hidden');
+        return;
+    }
+
+    chatStateMessageEl.textContent = message;
+    chatStateMessageEl.classList.remove('hidden');
+
+    if (type === 'loading') {
+        chatStateMessageEl.classList.add('loading-state');
+    } else if (type === 'error') {
+        chatStateMessageEl.classList.add('error-state');
+    } else if (type === 'empty') {
+        chatStateMessageEl.classList.add('empty-messages');
+    }
+
+    const hideMessages = type === 'loading' || type === 'error' || type === 'empty';
+    chatMessagesEl.classList.toggle('hidden', hideMessages);
 }
 
 function selectUser(userId, displayName) {
     state.selectedUserId = userId;
+    state.messages = [];
 
-    document.getElementById('chatWelcome').style.display = 'none';
-    document.getElementById('chatMessagesContainer').style.display = 'flex';
+    clearAttachmentSelection();
+    clearAttachmentWarning();
 
-    document.getElementById('chatMessagesHeader').innerHTML = `
-        <div class="user-avatar">${displayName.charAt(0).toUpperCase()}</div>
-        <div><div class="user-name">${displayName}</div></div>
-    `;
+    if (chatWelcomeEl) {
+        chatWelcomeEl.style.display = 'none';
+    }
 
-    loadMessages(userId);
+    if (chatMessagesContainerEl) {
+        chatMessagesContainerEl.style.display = 'flex';
+    }
+
+    if (chatMessagesEl) {
+        chatMessagesEl.innerHTML = '';
+        chatMessagesEl.classList.add('hidden');
+    }
+
+    renderChatHeader(displayName);
+    updateChatState('loading', 'Nachrichten werden geladen…');
     renderUserList();
+    loadMessages(userId);
 }
 
 async function loadMessages(userId) {
-    const response = await fetch(`?action=get_messages&user_id=${userId}`);
-    const result = await response.json();
+    if (!userId) {
+        return;
+    }
 
-    if (result.success) {
-        state.messages = result.messages;
-        renderMessages();
-        markAsRead(userId);
+    if (messageAbortController) {
+        messageAbortController.abort();
+    }
 
-        if (result.messages.length > 0) {
-            state.lastMessageId = Math.max(...result.messages.map(m => m.id));
+    const currentController = new AbortController();
+    messageAbortController = currentController;
+
+    state.isLoadingMessages = true;
+    updateChatState('loading', 'Nachrichten werden geladen…');
+
+    try {
+        const response = await fetch(`?action=get_messages&user_id=${userId}`, { signal: currentController.signal });
+        if (!response.ok) {
+            throw new Error('NETZWERK_FEHLER');
+        }
+
+        const result = await response.json();
+
+        if (!result.success) {
+            throw new Error(result.error || 'Nachrichten konnten nicht geladen werden.');
+        }
+
+        state.messages = Array.isArray(result.messages) ? result.messages : [];
+
+        if (state.messages.length > 0) {
+            renderMessages();
+            markAsRead(userId);
+            const newLastMessageId = Math.max(...state.messages.map(m => Number(m.id))); 
+            state.lastMessageId = Math.max(state.lastMessageId, newLastMessageId);
+        } else {
+            if (chatMessagesEl) {
+                chatMessagesEl.innerHTML = '';
+            }
+            updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
+        }
+    } catch (error) {
+        if (error && error.name === 'AbortError') {
+            return;
+        }
+        console.error('Nachrichten konnten nicht geladen werden:', error);
+        state.messages = [];
+        if (chatMessagesEl) {
+            chatMessagesEl.innerHTML = '';
+        }
+        const errorMessage = (error && error.message && error.message !== 'NETZWERK_FEHLER')
+            ? error.message
+            : 'Nachrichten konnten nicht geladen werden. Bitte versuche es erneut.';
+        updateChatState('error', errorMessage);
+    } finally {
+        if (messageAbortController === currentController) {
+            messageAbortController = null;
+            state.isLoadingMessages = false;
         }
     }
 }
 
 function renderMessages() {
-    const container = document.getElementById('chatMessages');
+    const container = chatMessagesEl;
+
+    if (!container) {
+        return;
+    }
+
+    if (!Array.isArray(state.messages) || state.messages.length === 0) {
+        container.innerHTML = '';
+        return;
+    }
 
     container.innerHTML = state.messages.map(msg => {
         const isSent = msg.from_user_id === state.currentUserId;
         const time = new Date(msg.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+        const hasText = typeof msg.message === 'string' && msg.message.trim() !== '';
+        const attachmentUrl = msg.attachment_url;
+
+        const textHtml = hasText ? `<div class="message-text">${escapeHtml(msg.message)}</div>` : '';
+        const attachmentHtml = attachmentUrl
+            ? `<div class="message-attachment"><a href="${escapeAttribute(attachmentUrl)}" target="_blank" rel="noopener"><img src="${escapeAttribute(attachmentUrl)}" alt="Gesendetes Bild"></a></div>`
+            : '';
 
         return `
             <div class="message ${isSent ? 'message-sent' : 'message-received'}">
-                <div class="message-text">${escapeHtml(msg.message)}</div>
+                ${attachmentHtml}
+                ${textHtml}
                 <div class="message-time">${time}</div>
             </div>
         `;
     }).join('');
 
+    container.classList.remove('hidden');
     container.scrollTop = container.scrollHeight;
+    updateChatState(null);
+}
+
+function clearAttachmentSelection() {
+    if (attachmentInputEl) {
+        attachmentInputEl.value = '';
+    }
+    if (attachmentInfoEl) {
+        attachmentInfoEl.classList.add('hidden');
+    }
+    if (attachmentFileNameEl) {
+        attachmentFileNameEl.textContent = '';
+    }
+}
+
+function showAttachmentWarning(message) {
+    if (attachmentWarningEl) {
+        attachmentWarningEl.textContent = message;
+        attachmentWarningEl.classList.remove('hidden');
+    } else {
+        alert(message);
+    }
+}
+
+function clearAttachmentWarning() {
+    if (attachmentWarningEl) {
+        attachmentWarningEl.textContent = '';
+        attachmentWarningEl.classList.add('hidden');
+    }
 }
 
 async function sendMessage() {
-    const input = document.getElementById('chatInput');
-    const message = input.value.trim();
+    if (!chatInputEl) {
+        return;
+    }
 
-    if (!message || !state.selectedUserId) return;
+    if (!state.selectedUserId) {
+        showAttachmentWarning('Bitte wähle zuerst einen Chat aus.');
+        return;
+    }
+
+    const message = chatInputEl.value.trim();
+    const attachmentFile = attachmentInputEl?.files?.[0] || null;
+
+    if (!message && !attachmentFile) {
+        showAttachmentWarning('Bitte gib eine Nachricht ein oder hänge ein JPG-Bild an.');
+        return;
+    }
+
+    clearAttachmentWarning();
+
+    if (attachmentFile) {
+        const fileType = (attachmentFile.type || '').toLowerCase();
+        const fileName = attachmentFile.name || '';
+        const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
+
+        if (!isJpeg) {
+            showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
+            clearAttachmentSelection();
+            return;
+        }
+
+        if (attachmentFile.size > ATTACHMENT_MAX_SIZE) {
+            showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
+            clearAttachmentSelection();
+            return;
+        }
+    }
 
     const formData = new FormData();
     formData.append('action', 'send_message');
     formData.append('to_user_id', state.selectedUserId);
     formData.append('message', message);
 
-    const response = await fetch('', { method: 'POST', body: formData });
-    const result = await response.json();
+    if (attachmentFile) {
+        formData.append('attachment', attachmentFile);
+    }
 
-    if (result.success) {
-        input.value = '';
-    } else {
-        alert(result.error);
+    try {
+        const response = await fetch('', { method: 'POST', body: formData });
+        const result = await response.json();
+
+        if (result.success) {
+            chatInputEl.value = '';
+            chatInputEl.dispatchEvent(new Event('input'));
+            clearAttachmentSelection();
+            clearAttachmentWarning();
+        } else {
+            showAttachmentWarning(result.error || 'Nachricht konnte nicht gesendet werden.');
+        }
+    } catch (error) {
+        console.error('Nachricht konnte nicht gesendet werden:', error);
+        showAttachmentWarning('Nachricht konnte nicht gesendet werden.');
     }
 }
 
@@ -2911,21 +3663,47 @@ async function markAsRead(userId) {
 }
 
 function startSSE() {
-    state.eventSource = new EventSource(`?stream=events&last_message_id=${state.lastMessageId}`);
+    if (state.eventSource) {
+        state.eventSource.close();
+    }
+
+    const url = `?stream=events&last_message_id=${state.lastMessageId}&t=${Date.now()}`;
+    state.eventSource = new EventSource(url);
+
+    state.eventSource.onopen = () => {
+        state.connectionErrorShown = false;
+
+        if (!state.selectedUserId) {
+            return;
+        }
+
+        if (state.isLoadingMessages) {
+            return;
+        }
+
+        if (state.messages.length === 0) {
+            updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
+        } else {
+            updateChatState(null);
+        }
+    };
 
     state.eventSource.onmessage = (event) => {
+        state.connectionErrorShown = false;
         const data = JSON.parse(event.data);
 
         if (data.type === 'messages' && data.messages) {
             data.messages.forEach(msg => {
-                if (msg.id > state.lastMessageId) {
-                    state.lastMessageId = msg.id;
+                const messageId = Number(msg.id);
+
+                if (messageId > state.lastMessageId) {
+                    state.lastMessageId = messageId;
 
                     if (state.selectedUserId &&
                         ((msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
                          (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId))) {
 
-                        if (!state.messages.find(m => m.id === msg.id)) {
+                        if (!state.messages.find(m => Number(m.id) === messageId)) {
                             state.messages.push(msg);
                             renderMessages();
 
@@ -2940,6 +3718,22 @@ function startSSE() {
             loadUsers();
         }
     };
+
+    state.eventSource.onerror = () => {
+        if (!state.connectionErrorShown) {
+            state.connectionErrorShown = true;
+            console.warn('SSE-Verbindung unterbrochen, versuche Neuverbindung.');
+            if (state.selectedUserId && !state.isLoadingMessages) {
+                updateChatState('error', 'Live-Verbindung unterbrochen. Erneuter Verbindungsversuch…');
+            }
+        }
+
+        if (state.eventSource) {
+            state.eventSource.close();
+        }
+
+        setTimeout(startSSE, 500);
+    };
 }
 
 function escapeHtml(text) {
@@ -2948,22 +3742,75 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-document.getElementById('sendButton').addEventListener('click', sendMessage);
-document.getElementById('chatInput').addEventListener('keypress', (e) => {
+function escapeAttribute(value) {
+    const div = document.createElement('div');
+    div.textContent = value ?? '';
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+attachmentButtonEl?.addEventListener('click', () => {
+    attachmentInputEl?.click();
+});
+
+attachmentInputEl?.addEventListener('change', () => {
+    clearAttachmentWarning();
+
+    if (!attachmentInputEl.files || attachmentInputEl.files.length === 0) {
+        clearAttachmentSelection();
+        return;
+    }
+
+    const file = attachmentInputEl.files[0];
+    const fileType = (file.type || '').toLowerCase();
+    const fileName = file.name || '';
+    const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
+
+    if (!isJpeg) {
+        showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
+        clearAttachmentSelection();
+        return;
+    }
+
+    if (file.size > ATTACHMENT_MAX_SIZE) {
+        showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
+        clearAttachmentSelection();
+        return;
+    }
+
+    if (attachmentInfoEl) {
+        attachmentInfoEl.classList.remove('hidden');
+    }
+
+    if (attachmentFileNameEl) {
+        const sizeKb = Math.max(1, Math.round(file.size / 1024));
+        attachmentFileNameEl.textContent = `${file.name} (${sizeKb} KB)`;
+    }
+});
+
+attachmentClearBtnEl?.addEventListener('click', () => {
+    clearAttachmentSelection();
+    clearAttachmentWarning();
+});
+
+sendButtonEl?.addEventListener('click', sendMessage);
+
+chatInputEl?.addEventListener('keypress', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
     }
 });
-document.getElementById('userSearch').addEventListener('input', renderUserList);
-document.getElementById('logoutBtn').addEventListener('click', async () => {
+
+userSearchInput?.addEventListener('input', () => renderUserList());
+
+document.getElementById('logoutBtn')?.addEventListener('click', async () => {
     const formData = new FormData();
     formData.append('action', 'logout');
     await fetch('', { method: 'POST', body: formData });
     window.location.reload();
 });
 
-document.getElementById('chatInput').addEventListener('input', function() {
+chatInputEl?.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 100) + 'px';
 });
