@@ -1646,7 +1646,6 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
             background: linear-gradient(135deg, #fef08a 0%, #f97316 100%);
-            background-color: #fff9db;
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -3016,7 +3015,6 @@ const chatStateMessageEl = document.getElementById('chatStateMessage');
 const chatMessagesHeaderEl = document.getElementById('chatMessagesHeader');
 const chatInputEl = document.getElementById('chatInput');
 const sendButtonEl = document.getElementById('sendButton');
-let messageAbortController = null;
 
 async function loadUsers() {
     if (!userListEl) {
@@ -3076,23 +3074,9 @@ function renderUserList() {
         return;
     }
 
-    const offlineLimit = 5;
-    const onlineUsers = [];
-    const offlineUsers = [];
-
-    filtered.forEach(user => {
-        if (user.is_online) {
-            onlineUsers.push(user);
-        } else {
-            offlineUsers.push(user);
-        }
-    });
-
-    const limitedUsers = onlineUsers.concat(offlineUsers.slice(0, offlineLimit));
-
     const fragment = document.createDocumentFragment();
 
-    limitedUsers.forEach(user => {
+    filtered.forEach(user => {
         const item = document.createElement('button');
         item.type = 'button';
         item.className = 'user-item' + (Number(user.id) === Number(state.selectedUserId) ? ' active' : '');
@@ -3140,15 +3124,6 @@ function renderUserList() {
 
     userListEl.innerHTML = '';
     userListEl.appendChild(fragment);
-
-    if (offlineUsers.length > offlineLimit) {
-        const hint = document.createElement('div');
-        hint.className = 'user-status';
-        hint.style.textAlign = 'center';
-        hint.style.marginTop = '12px';
-        hint.textContent = 'Weitere Offline-Nutzer werden ausgeblendet.';
-        userListEl.appendChild(hint);
-    }
 }
 
 function renderChatHeader(displayName) {
@@ -3230,18 +3205,11 @@ async function loadMessages(userId) {
         return;
     }
 
-    if (messageAbortController) {
-        messageAbortController.abort();
-    }
-
-    const currentController = new AbortController();
-    messageAbortController = currentController;
-
     state.isLoadingMessages = true;
     updateChatState('loading', 'Nachrichten werden geladen…');
 
     try {
-        const response = await fetch(`?action=get_messages&user_id=${userId}`, { signal: currentController.signal });
+        const response = await fetch(`?action=get_messages&user_id=${userId}`);
         if (!response.ok) {
             throw new Error('NETZWERK_FEHLER');
         }
@@ -3266,9 +3234,6 @@ async function loadMessages(userId) {
             updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
         }
     } catch (error) {
-        if (error && error.name === 'AbortError') {
-            return;
-        }
         console.error('Nachrichten konnten nicht geladen werden:', error);
         state.messages = [];
         if (chatMessagesEl) {
@@ -3279,10 +3244,7 @@ async function loadMessages(userId) {
             : 'Nachrichten konnten nicht geladen werden. Bitte versuche es erneut.';
         updateChatState('error', errorMessage);
     } finally {
-        if (messageAbortController === currentController) {
-            messageAbortController = null;
-            state.isLoadingMessages = false;
-        }
+        state.isLoadingMessages = false;
     }
 }
 
@@ -3419,7 +3381,7 @@ function startSSE() {
             state.eventSource.close();
         }
 
-        setTimeout(startSSE, 500);
+        setTimeout(startSSE, 1500);
     };
 }
 
