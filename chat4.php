@@ -260,8 +260,9 @@ function calculateAge($birthdate) {
 
 function getAgeGroup($birthdate) {
     $age = calculateAge($birthdate);
-    return $age < 18 ? 'U18' : 'O18';
+    return $age < 18 ? 'U18' : 'O18';  // ✅ O18, nicht Ü18!
 }
+
 
 function checkKeywordBlacklist($message) {
     global $KEYWORD_BLACKLIST;
@@ -877,180 +878,169 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // GET USERS
     // ───────────────────────────────────────────────────────
     if ($action === 'get_users') {
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        $currentAgeGroup = getCurrentAgeGroup();
+    $db = getDB();
+    $currentUserId = getCurrentUserId();
+    $currentAgeGroup = getCurrentAgeGroup();
+
+    $query = '
+        SELECT
+            u.id,
+            u.username,
+            u.user_id as display_id,
+            u.age_group,
+            u.last_seen,
+            CASE
+                WHEN os.last_ping IS NOT NULL
+                AND (julianday("now") - julianday(os.last_ping)) * 86400 < ' . ONLINE_TIMEOUT_SECONDS . '
+                THEN 1
+                ELSE 0
+            END as is_online,
+            (
+                SELECT COUNT(*)
+                FROM messages
+                WHERE from_user_id = u.id
+                AND to_user_id = :current_user_id
+                AND is_read = 0
+            ) as unread_count,
+            (
+                SELECT COUNT(*)
+                FROM blocks
+                WHERE blocker_id = :current_user_id
+                AND blocked_id = u.id
+            ) as is_blocked_by_me,
+            (
+                SELECT COUNT(*)
+                FROM blocks
+                WHERE blocker_id = u.id
+                AND blocked_id = :current_user_id
+            ) as has_blocked_me
+        FROM users u
+        LEFT JOIN online_status os ON u.id = os.user_id
+        WHERE u.id != :current_user_id
+        AND u.is_banned = 0
+        -- AND u.age_group = :age_group
+        ORDER BY is_online DESC, u.username ASC
+    ';
+
+    $stmt = $db->prepare($query);
+    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+    //$stmt->bindValue(':age_group', $currentAgeGroup, SQLITE3_TEXT);
+    $result = $stmt->execute();
+
+    $users = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        // Don't show users who blocked me or I blocked
+        if ($row['is_blocked_by_me'] > 0 || $row['has_blocked_me'] > 0) {
+            continue;
+        }
         
-        $query = '
+        $users[] = [
+            'id' => $row['id'],
+            'username' => $row['username'],
+            'display_id' => $row['display_id'],
+            'display_name' => $row['username'] . '#' . $row['display_id'],
+            'age_group' => $row['age_group'],
+            'is_online' => $row['is_online'],
+            'unread_count' => $row['unread_count']
+        ];
+    }
+    
+    echo json_encode(['success' => true, 'users' => $users]);
+    exit;
+}
+
+// ───────────────────────────────────────────────────────
+// GET MESSAGES
+// ───────────────────────────────────────────────────────
+if ($action === 'get_messages') {
+    $otherUserId = intval($_GET['user_id'] ?? 0);
+    
+    if ($otherUserId <= 0) {
+        echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
+        exit;
+    }
+    
+    $db = getDB();
+    $currentUserId = getCurrentUserId();
+    $currentAgeGroup = getCurrentAgeGroup();
+    
+    // Check if other user exists and age groups are compatible
+    $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+    $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $otherUser = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if (!$otherUser) {
+        echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
+        exit;
+    }
+    
+    if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
+        logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "GET_MESSAGES -> User $otherUserId");
+        echo json_encode(['success' => false, 'error' => 'Chat zwischen Altersgruppen nicht erlaubt']);
+        exit;
+    }
+    
+    // Check if blocked
+    if (isBlocked($currentUserId, $otherUserId)) {
+        echo json_encode(['success' => true, 'messages' => []]);
+        exit;
+    }
+    
+    $query = '
+        SELECT * FROM (
             SELECT
-                u.id,
-                u.username,
-                u.user_id as display_id,
-                u.age_group,
-                u.last_seen,
-                CASE
-                    WHEN os.last_ping IS NOT NULL
-                    AND (julianday("now") - julianday(os.last_ping)) * 86400 < ' . ONLINE_TIMEOUT_SECONDS . '
-                    THEN 1
-                    ELSE 0
-                END as is_online,
-                (
-                    SELECT COUNT(*)
-                    FROM messages
-                    WHERE from_user_id = u.id
-                    AND to_user_id = :current_user_id
-                    AND is_read = 0
-                ) as unread_count,
-                (
-                    SELECT COUNT(*)
-                    FROM blocks
-                    WHERE blocker_id = :current_user_id
-                    AND blocked_id = u.id
-                ) as is_blocked_by_me,
-                (
-                    SELECT COUNT(*)
-                    FROM blocks
-                    WHERE blocker_id = u.id
-                    AND blocked_id = :current_user_id
-                ) as has_blocked_me
-            FROM users u
-            LEFT JOIN online_status os ON u.id = os.user_id
-            WHERE u.id != :current_user_id
-            AND u.is_banned = 0
-        ';
-
-        if ($currentAgeGroup === 'U18') {
-            $query .= ' AND u.age_group = :allowed_group';
-        } else {
-            $query .= ' AND u.age_group != :blocked_group';
-        }
-
-        $query .= ' ORDER BY is_online DESC, u.username ASC';
-
-        $stmt = $db->prepare($query);
-        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-
-        if ($currentAgeGroup === 'U18') {
-            $stmt->bindValue(':allowed_group', 'U18', SQLITE3_TEXT);
-        } else {
-            $stmt->bindValue(':blocked_group', 'U18', SQLITE3_TEXT);
-        }
-        $result = $stmt->execute();
-        
-        $users = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            // Don't show users who blocked me or I blocked
-            if ($row['is_blocked_by_me'] > 0 || $row['has_blocked_me'] > 0) {
-                continue;
-            }
-            
-            $users[] = [
-                'id' => $row['id'],
-                'username' => $row['username'],
-                'display_id' => $row['display_id'],
-                'display_name' => $row['username'] . '#' . $row['display_id'],
-                'age_group' => $row['age_group'],
-                'is_online' => $row['is_online'],
-                'unread_count' => $row['unread_count']
-            ];
-        }
-        
-        echo json_encode(['success' => true, 'users' => $users]);
-        exit;
+                m.id,
+                m.from_user_id,
+                m.to_user_id,
+                m.message,
+                m.timestamp,
+                m.is_read,
+                m.is_flagged,
+                m.attachment_path,
+                m.attachment_type,
+                m.attachment_size,
+                u.username as from_username,
+                u.user_id as from_display_id
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE
+                (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
+                OR
+                (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
+            ORDER BY m.id DESC
+            LIMIT :limit
+        )
+        ORDER BY id ASC
+    ';
+    
+    $stmt = $db->prepare($query);
+    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+    $stmt->bindValue(':other_user_id', $otherUserId, SQLITE3_INTEGER);
+    $stmt->bindValue(':limit', MAX_MESSAGES_PER_FETCH, SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    
+    $messages = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $messages[] = [
+            'id' => $row['id'],
+            'from_user_id' => $row['from_user_id'],
+            'to_user_id' => $row['to_user_id'],
+            'message' => $row['message'],
+            'timestamp' => $row['timestamp'],
+            'is_read' => $row['is_read'],
+            'attachment_url' => $row['attachment_path'] ?: null,
+            'attachment_type' => $row['attachment_type'] ?: null,
+            'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
+            'from_username' => $row['from_username'],
+            'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
+        ];
     }
     
-    // ───────────────────────────────────────────────────────
-    // GET MESSAGES
-    // ───────────────────────────────────────────────────────
-    if ($action === 'get_messages') {
-        $otherUserId = intval($_GET['user_id'] ?? 0);
+    echo json_encode(['success' => true, 'messages' => $messages]);
+    exit;
+}
 
-        if ($otherUserId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
-            exit;
-        }
-
-        // Check if blocked
-        if (isBlocked(getCurrentUserId(), $otherUserId)) {
-            echo json_encode(['success' => false, 'error' => 'Chat nicht verfügbar']);
-            exit;
-        }
-
-        $db = getDB();
-        $currentUserId = getCurrentUserId();
-        $currentAgeGroup = getCurrentAgeGroup();
-
-        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
-        $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
-        $result = $stmt->execute();
-        $otherUser = $result->fetchArray(SQLITE3_ASSOC);
-
-        if (!$otherUser) {
-            echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
-            exit;
-        }
-
-        if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
-            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "GET_MESSAGES -> User $otherUserId");
-            echo json_encode(['success' => false, 'error' => 'Chat zwischen Altersgruppen nicht erlaubt']);
-            exit;
-        }
-
-        $query = '
-            SELECT * FROM (
-                SELECT
-                    m.id,
-                    m.from_user_id,
-                    m.to_user_id,
-                    m.message,
-                    m.timestamp,
-                    m.is_read,
-                    m.is_flagged,
-                    m.attachment_path,
-                    m.attachment_type,
-                    m.attachment_size,
-                    u.username as from_username,
-                    u.user_id as from_display_id
-                FROM messages m
-                JOIN users u ON m.from_user_id = u.id
-                WHERE
-                    (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
-                    OR
-                    (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
-                ORDER BY m.id DESC
-                LIMIT :limit
-            )
-            ORDER BY id ASC
-        ';
-
-        $stmt = $db->prepare($query);
-        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':other_user_id', $otherUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':limit', MAX_MESSAGES_PER_FETCH, SQLITE3_INTEGER);
-        $result = $stmt->execute();
-        
-        $messages = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $messages[] = [
-                'id' => $row['id'],
-                'from_user_id' => $row['from_user_id'],
-                'to_user_id' => $row['to_user_id'],
-                'message' => $row['message'],
-                'timestamp' => $row['timestamp'],
-                'is_read' => $row['is_read'],
-                'is_flagged' => $row['is_flagged'],
-                'attachment_url' => $row['attachment_path'] ?: null,
-                'attachment_type' => $row['attachment_type'] ?: null,
-                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
-                'from_username' => $row['from_username'],
-                'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
-            ];
-        }
-        
-        echo json_encode(['success' => true, 'messages' => $messages]);
-        exit;
-    }
-    
     // ───────────────────────────────────────────────────────
     // SEND MESSAGE
     // ───────────────────────────────────────────────────────
@@ -3648,6 +3638,7 @@ const state = {
     users: [],
     messages: [],
     lastMessageId: 0,
+     reconnectTimer: null,
     eventSource: null,
     isLoadingUsers: false,
     isLoadingMessages: false,
@@ -4260,35 +4251,38 @@ function startSSE() {
             console.warn('Konnte SSE-Daten nicht verarbeiten:', error);
         }
     };
+state.eventSource.onerror = () => {
+    if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+    }
 
-    state.eventSource.onerror = () => {
-        if (state.eventSource) {
-            state.eventSource.close();
-            state.eventSource = null;
+    sseErrorCount += 1;
+
+    if (!state.connectionErrorShown) {
+        state.connectionErrorShown = true;
+        console.warn('SSE-Verbindung unterbrochen, versuche Neuverbindung.');
+        if (state.selectedUserId && !state.isLoadingMessages) {
+            updateChatState('error', 'Live-Verbindung unterbrochen. Erneuter Verbindungsversuch…');
         }
+    }
 
-        sseErrorCount += 1;
+    if (usePollingFallback || sseErrorCount >= 3) {
+        enablePollingFallback();
+        return;
+    }
 
-        if (!state.connectionErrorShown) {
-            state.connectionErrorShown = true;
-            console.warn('SSE-Verbindung unterbrochen, versuche Neuverbindung.');
-            if (state.selectedUserId && !state.isLoadingMessages) {
-                updateChatState('error', 'Live-Verbindung unterbrochen. Erneuter Verbindungsversuch…');
-            }
-        }
-
-        if (usePollingFallback || sseErrorCount >= 3) {
-            enablePollingFallback();
-            return;
-        }
-
-        setTimeout(() => {
+    // ✅ Verhindere mehrfache Reconnects
+    if (!state.reconnectTimer) {
+        state.reconnectTimer = setTimeout(() => {
+            state.reconnectTimer = null;
             if (!usePollingFallback) {
                 startSSE();
             }
-        }, 500);
-    };
-}
+        }, Math.min(500 * sseErrorCount, 5000)); // Exponential Backoff
+    }
+};
+
 
 function escapeHtml(text) {
     const div = document.createElement('div');
