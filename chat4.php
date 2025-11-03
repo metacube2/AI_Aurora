@@ -1856,9 +1856,16 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     echo ": connected\n\n";
     echo "retry: " . SSE_RETRY_MS . "\n\n";
     flush();
-    
-    $db = getDB();
-    
+
+    $lastPingTime = time();
+
+    while (true) {
+        if (connection_aborted()) {
+            break;
+        }
+
+        $db = getDB();
+
         $stmt = $db->prepare('
             SELECT
                 m.id,
@@ -1873,52 +1880,61 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                 uf.user_id as from_display_id,
                 uf.age_group as from_age_group,
                 ut.age_group as to_age_group
-        FROM messages m
-        JOIN users uf ON m.from_user_id = uf.id
-        JOIN users ut ON m.to_user_id = ut.id
-        WHERE m.id > :last_message_id
-        AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
-        AND NOT EXISTS (
-            SELECT 1 FROM blocks
-            WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
-            OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
-        )
-        ORDER BY m.id ASC
-    ');
-    $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
-    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $messages = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+            FROM messages m
+            JOIN users uf ON m.from_user_id = uf.id
+            JOIN users ut ON m.to_user_id = ut.id
+            WHERE m.id > :last_message_id
+            AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
+            AND NOT EXISTS (
+                SELECT 1 FROM blocks
+                WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
+                OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
+            )
+            ORDER BY m.id ASC
+        ');
+        $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
+        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
 
-        if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
-            continue;
+        $messages = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+            if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+                continue;
+            }
+
+            $messages[] = [
+                'id' => $row['id'],
+                'from_user_id' => $row['from_user_id'],
+                'to_user_id' => $row['to_user_id'],
+                'message' => $row['message'],
+                'timestamp' => $row['timestamp'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
+                'from_username' => $row['from_username'],
+                'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
+            ];
+
+            $lastMessageId = max($lastMessageId, (int)$row['id']);
         }
 
-        $messages[] = [
-            'id' => $row['id'],
-            'from_user_id' => $row['from_user_id'],
-            'to_user_id' => $row['to_user_id'],
-            'message' => $row['message'],
-            'timestamp' => $row['timestamp'],
-            'attachment_url' => $row['attachment_path'] ?: null,
-            'attachment_type' => $row['attachment_type'] ?: null,
-            'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
-            'from_username' => $row['from_username'],
-            'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
-        ];
+        if (!empty($messages)) {
+            echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
+            flush();
+        }
+
+        if (time() - $lastPingTime >= 15) {
+            echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
+            flush();
+            $lastPingTime = time();
+            touchUserSession($currentUserId);
+        }
+
+        usleep(500000);
     }
-    
-    if (!empty($messages)) {
-        echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
-        flush();
-    } else {
-        echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
-        flush();
-    }
-    
+
     exit;
 }
 
@@ -3770,14 +3786,6 @@ function enablePollingFallback() {
     startPollingUpdates();
 }
 
-function startRealtime() {
-    if (usePollingFallback) {
-        startPollingUpdates();
-    } else {
-        startSSE();
-    }
-}
-
 async function loadUsers() {
     if (!userListEl) {
         return;
@@ -4174,6 +4182,9 @@ async function sendMessage() {
             clearAttachmentSelection();
             clearAttachmentWarning();
         } else {
+            if (result.error && /bild/i.test(result.error)) {
+                clearAttachmentSelection();
+            }
             showAttachmentWarning(result.error || 'Nachricht konnte nicht gesendet werden.');
         }
     } catch (error) {
@@ -4192,6 +4203,11 @@ async function markAsRead(userId) {
 }
 
 function startSSE() {
+    if (usePollingFallback) {
+        startPollingUpdates();
+        return;
+    }
+
     stopPollingUpdates();
 
     if (state.eventSource) {
@@ -4360,7 +4376,7 @@ setInterval(async () => {
 }, 10000);
 
 loadUsers();
-startRealtime();
+startSSE();
 setInterval(loadUsers, 30000);
 
 <?php endif; ?>
