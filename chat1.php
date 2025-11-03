@@ -339,6 +339,20 @@ function logSecurityEvent($userId, $action, $details = '') {
     $stmt->execute();
 }
 
+function canUsersChatByAge($ageGroupA, $ageGroupB) {
+    if (!$ageGroupA || !$ageGroupB) {
+        return false;
+    }
+
+    // Wenn einer minderjährig ist, müssen beide minderjährig sein
+    if ($ageGroupA === 'U18' || $ageGroupB === 'U18') {
+        return $ageGroupA === 'U18' && $ageGroupB === 'U18';
+    }
+
+    // Volljährige dürfen miteinander chatten
+    return true;
+}
+
 function isBlocked($userId, $otherUserId) {
     $db = getDB();
     $stmt = $db->prepare('
@@ -656,23 +670,40 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'get_messages') {
         $otherUserId = intval($_GET['user_id'] ?? 0);
-        
+
         if ($otherUserId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
+
         // Check if blocked
         if (isBlocked(getCurrentUserId(), $otherUserId)) {
             echo json_encode(['success' => false, 'error' => 'Chat nicht verfügbar']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
-        
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $otherUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$otherUser) {
+            echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "GET_MESSAGES -> User $otherUserId");
+            echo json_encode(['success' => false, 'error' => 'Chat zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         $query = '
-            SELECT 
+            SELECT
                 m.id,
                 m.from_user_id,
                 m.to_user_id,
@@ -746,7 +777,23 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $db = getDB();
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
-        
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $toUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $targetUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$targetUser) {
+            echo json_encode(['success' => false, 'error' => 'Empfänger nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $targetUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "SEND_MESSAGE -> User $toUserId");
+            echo json_encode(['success' => false, 'error' => 'Nachrichten zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         // Rate Limiting
         $rateLimitCheck = checkRateLimit($currentUserId, $currentAgeGroup);
         if (!$rateLimitCheck['allowed']) {
@@ -853,14 +900,31 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
-        
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $otherUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$otherUser) {
+            echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "MARK_READ -> User $otherUserId");
+            echo json_encode(['success' => false, 'error' => 'Aktion zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         $stmt = $db->prepare('
-            UPDATE messages 
-            SET is_read = 1 
-            WHERE from_user_id = :other_user_id 
+            UPDATE messages
+            SET is_read = 1
+            WHERE from_user_id = :other_user_id
             AND to_user_id = :current_user_id 
             AND is_read = 0
         ');
@@ -1305,6 +1369,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     header('X-Accel-Buffering: no');
     
     $currentUserId = getCurrentUserId();
+    $currentAgeGroup = getCurrentAgeGroup();
     $lastMessageId = intval($_GET['last_message_id'] ?? 0);
     
     set_time_limit(0);
@@ -1320,20 +1385,23 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     $db = getDB();
     
     $stmt = $db->prepare('
-        SELECT 
+        SELECT
             m.id,
             m.from_user_id,
             m.to_user_id,
             m.message,
             m.timestamp,
-            u.username as from_username,
-            u.user_id as from_display_id
+            uf.username as from_username,
+            uf.user_id as from_display_id,
+            uf.age_group as from_age_group,
+            ut.age_group as to_age_group
         FROM messages m
-        JOIN users u ON m.from_user_id = u.id
+        JOIN users uf ON m.from_user_id = uf.id
+        JOIN users ut ON m.to_user_id = ut.id
         WHERE m.id > :last_message_id
         AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
         AND NOT EXISTS (
-            SELECT 1 FROM blocks 
+            SELECT 1 FROM blocks
             WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
             OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
         )
@@ -1345,6 +1413,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     
     $messages = [];
     while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+            continue;
+        }
+
         $messages[] = [
             'id' => $row['id'],
             'from_user_id' => $row['from_user_id'],
