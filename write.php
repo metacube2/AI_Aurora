@@ -195,8 +195,25 @@ function getDB() {
     if ($row['count'] == 0) {
         $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
         $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-        $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
-        $stmt->execute();
+        $result = $stmt->execute();
+        $row = $result->fetchArray(SQLITE3_ASSOC);
+
+        if ($row['count'] == 0) {
+            $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
+            $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+            $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
+            $stmt->execute();
+        }
+
+        // Create indexes
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user_id, to_user_id)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen)');
+
+        $initialized = true;
     }
     
     // Create indexes
@@ -383,9 +400,27 @@ function isBlocked($userId, $otherUserId) {
 
 function cleanupOldData() {
     $db = getDB();
-    
+
     // Delete old messages
     $hours = MESSAGE_RETENTION_HOURS;
+    $attachmentResult = $db->query("SELECT attachment_path FROM messages WHERE attachment_path IS NOT NULL AND timestamp < datetime('now', '-{$hours} hours')");
+    while ($attachmentRow = $attachmentResult->fetchArray(SQLITE3_ASSOC)) {
+        $relativePath = $attachmentRow['attachment_path'] ?? '';
+        if (!$relativePath) {
+            continue;
+        }
+
+        $normalizedPath = str_replace('\\', '/', $relativePath);
+        if (strpos($normalizedPath, 'uploads/') !== 0) {
+            continue;
+        }
+
+        $fullPath = __DIR__ . '/' . $normalizedPath;
+        if (is_file($fullPath)) {
+            @unlink($fullPath);
+        }
+    }
+
     $db->exec("DELETE FROM messages WHERE timestamp < datetime('now', '-{$hours} hours')");
     
     // Delete old rate limits
@@ -899,6 +934,9 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
                 'timestamp' => $row['timestamp'],
                 'is_read' => $row['is_read'],
                 'is_flagged' => $row['is_flagged'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
                 'from_username' => $row['from_username'],
                 'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
             ];
@@ -914,28 +952,81 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     if ($action === 'send_message') {
         $toUserId = intval($_POST['to_user_id'] ?? 0);
         $message = trim($_POST['message'] ?? '');
-        
+        $hasAttachment = isset($_FILES['attachment']) && ($_FILES['attachment']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE;
+
         if ($toUserId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
-        if (empty($message)) {
-            echo json_encode(['success' => false, 'error' => 'Nachricht darf nicht leer sein']);
+
+        if (!$hasAttachment && $message === '') {
+            echo json_encode(['success' => false, 'error' => 'Nachricht oder Bild erforderlich']);
             exit;
         }
-        
+
         if (strlen($message) > 1000) {
             echo json_encode(['success' => false, 'error' => 'Nachricht zu lang (max 1000 Zeichen)']);
             exit;
         }
-        
+
+        $attachmentFile = $hasAttachment ? $_FILES['attachment'] : null;
+        $attachmentMime = null;
+        $attachmentSize = null;
+
+        if ($hasAttachment && $attachmentFile) {
+            if (!is_uploaded_file($attachmentFile['tmp_name'])) {
+                echo json_encode(['success' => false, 'error' => 'Ungültiger Datei-Upload']);
+                exit;
+            }
+
+            if ($attachmentFile['error'] !== UPLOAD_ERR_OK) {
+                echo json_encode(['success' => false, 'error' => 'Bild konnte nicht hochgeladen werden']);
+                exit;
+            }
+
+            if ($attachmentFile['size'] > MAX_ATTACHMENT_SIZE) {
+                echo json_encode(['success' => false, 'error' => 'Bild ist zu groß (max. 200 KB)']);
+                exit;
+            }
+
+            $attachmentSize = (int)$attachmentFile['size'];
+
+            $mime = null;
+            if (function_exists('finfo_open')) {
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                if ($finfo) {
+                    $mime = finfo_file($finfo, $attachmentFile['tmp_name']);
+                    finfo_close($finfo);
+                }
+            }
+            if (!$mime && function_exists('mime_content_type')) {
+                $mime = mime_content_type($attachmentFile['tmp_name']);
+            }
+            if (!$mime && isset($attachmentFile['type'])) {
+                $mime = $attachmentFile['type'];
+            }
+
+            $mime = strtolower((string)$mime);
+            if (!in_array($mime, ['image/jpeg', 'image/pjpeg', 'image/jpg'], true)) {
+                echo json_encode(['success' => false, 'error' => 'Nur JPG-Bilder sind erlaubt']);
+                exit;
+            }
+
+            $imageInfo = @getimagesize($attachmentFile['tmp_name']);
+            if ($imageInfo === false || !in_array($imageInfo[2], [IMAGETYPE_JPEG], true)) {
+                echo json_encode(['success' => false, 'error' => 'Bilddatei konnte nicht verifiziert werden']);
+                exit;
+            }
+
+            $attachmentMime = 'image/jpeg';
+        }
+
         // Check if blocked
         if (isBlocked(getCurrentUserId(), $toUserId)) {
             echo json_encode(['success' => false, 'error' => 'Nachricht kann nicht gesendet werden']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
@@ -963,91 +1054,119 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             echo json_encode(['success' => false, 'error' => $rateLimitCheck['reason']]);
             exit;
         }
-        
-        // Keyword Blacklist
-        $keywordCheck = checkKeywordBlacklist($message);
-        if ($keywordCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
-            echo json_encode([
-                'success' => false,
-                'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
-                'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
-            ]);
-            exit;
+
+        if ($message !== '') {
+            // Keyword Blacklist
+            $keywordCheck = checkKeywordBlacklist($message);
+            if ($keywordCheck['blocked']) {
+                logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
+                    'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
+                ]);
+                exit;
+            }
+
+            // Profanity Filter
+            $profanityCheck = checkProfanityFilter($message);
+            if ($profanityCheck['blocked']) {
+                logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'Deine Nachricht enthält Schimpfwörter',
+                    'details' => 'Bitte verwende eine angemessene Sprache'
+                ]);
+                exit;
+            }
+
+            // Link Filter
+            $linkCheck = checkLinkFilter($message);
+            if ($linkCheck['blocked']) {
+                logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'Links sind nicht erlaubt',
+                    'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
+                ]);
+                exit;
+            }
         }
-        
-        // Profanity Filter
-        $profanityCheck = checkProfanityFilter($message);
-        if ($profanityCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Deine Nachricht enthält Schimpfwörter',
-                'details' => 'Bitte verwende eine angemessene Sprache'
-            ]);
-            exit;
-        }
-        
-        // Link Filter
-        $linkCheck = checkLinkFilter($message);
-        if ($linkCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Links sind nicht erlaubt',
-                'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
-            ]);
-            exit;
-        }
-        
+
         // Auto-Flagging (verdächtige Muster)
         $isFlagged = 0;
         $flagReason = '';
-        
-        // Check for repeated characters (AAAAAAA)
-        if (preg_match('/(.)\1{5,}/', $message)) {
-            $isFlagged = 1;
-            $flagReason = 'Repeated characters';
+
+        if ($message !== '') {
+            if (preg_match('/(.)\1{5,}/', $message)) {
+                $isFlagged = 1;
+                $flagReason = 'Repeated characters';
+            }
+
+            if (strlen($message) > 20 && $message === strtoupper($message)) {
+                $isFlagged = 1;
+                $flagReason = 'All caps';
+            }
+
+            $emojiCount = preg_match_all('/[\x{1F600}-\x{1F64F}]/u', $message);
+            if ($emojiCount > 10) {
+                $isFlagged = 1;
+                $flagReason = 'Excessive emojis';
+            }
         }
-        
-        // Check for all caps (min 20 chars)
-        if (strlen($message) > 20 && $message === strtoupper($message)) {
-            $isFlagged = 1;
-            $flagReason = 'All caps';
+
+        $attachmentPath = null;
+        if ($hasAttachment && $attachmentFile) {
+            $randomName = bin2hex(random_bytes(16)) . '.jpg';
+            $destination = rtrim(UPLOAD_DIR, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $randomName;
+
+            if (!move_uploaded_file($attachmentFile['tmp_name'], $destination)) {
+                echo json_encode(['success' => false, 'error' => 'Bild konnte nicht gespeichert werden']);
+                exit;
+            }
+
+            $attachmentPath = 'uploads/' . $randomName;
         }
-        
-        // Check for excessive emojis
-        $emojiCount = preg_match_all('/[\x{1F600}-\x{1F64F}]/u', $message);
-        if ($emojiCount > 10) {
-            $isFlagged = 1;
-            $flagReason = 'Excessive emojis';
-        }
-        
+
         // Insert message
         $stmt = $db->prepare('
-            INSERT INTO messages (from_user_id, to_user_id, message, is_flagged, flag_reason)
-            VALUES (:from_user_id, :to_user_id, :message, :is_flagged, :flag_reason)
+            INSERT INTO messages (from_user_id, to_user_id, message, is_flagged, flag_reason, attachment_path, attachment_type, attachment_size)
+            VALUES (:from_user_id, :to_user_id, :message, :is_flagged, :flag_reason, :attachment_path, :attachment_type, :attachment_size)
         ');
         $stmt->bindValue(':from_user_id', $currentUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':to_user_id', $toUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':message', $message, SQLITE3_TEXT);
         $stmt->bindValue(':is_flagged', $isFlagged, SQLITE3_INTEGER);
         $stmt->bindValue(':flag_reason', $flagReason, SQLITE3_TEXT);
+        if ($attachmentPath) {
+            $stmt->bindValue(':attachment_path', $attachmentPath, SQLITE3_TEXT);
+            $stmt->bindValue(':attachment_type', $attachmentMime, SQLITE3_TEXT);
+            $stmt->bindValue(':attachment_size', $attachmentSize, SQLITE3_INTEGER);
+        } else {
+            $stmt->bindValue(':attachment_path', null, SQLITE3_NULL);
+            $stmt->bindValue(':attachment_type', null, SQLITE3_NULL);
+            $stmt->bindValue(':attachment_size', null, SQLITE3_NULL);
+        }
         $stmt->execute();
-        
+
         $messageId = $db->lastInsertRowID();
-        
+
         // Log rate limit
         logRateLimit($currentUserId);
-        
+
         if ($isFlagged) {
             logSecurityEvent($currentUserId, 'MESSAGE_FLAGGED', "Reason: $flagReason, Message ID: $messageId");
         }
-        
+
+        if ($attachmentPath) {
+            logSecurityEvent($currentUserId, 'ATTACHMENT_UPLOADED', "Message ID: $messageId, Size: $attachmentSize");
+        }
+
         echo json_encode([
             'success' => true,
             'message_id' => $messageId,
-            'timestamp' => date('Y-m-d H:i:s')
+            'timestamp' => date('Y-m-d H:i:s'),
+            'attachment_url' => $attachmentPath
         ]);
         exit;
     }
@@ -1552,17 +1671,20 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     
     $db = getDB();
     
-    $stmt = $db->prepare('
-        SELECT
-            m.id,
-            m.from_user_id,
-            m.to_user_id,
-            m.message,
-            m.timestamp,
-            uf.username as from_username,
-            uf.user_id as from_display_id,
-            uf.age_group as from_age_group,
-            ut.age_group as to_age_group
+        $stmt = $db->prepare('
+            SELECT
+                m.id,
+                m.from_user_id,
+                m.to_user_id,
+                m.message,
+                m.timestamp,
+                m.attachment_path,
+                m.attachment_type,
+                m.attachment_size,
+                uf.username as from_username,
+                uf.user_id as from_display_id,
+                uf.age_group as from_age_group,
+                ut.age_group as to_age_group
         FROM messages m
         JOIN users uf ON m.from_user_id = uf.id
         JOIN users ut ON m.to_user_id = ut.id
@@ -1593,6 +1715,9 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             'to_user_id' => $row['to_user_id'],
             'message' => $row['message'],
             'timestamp' => $row['timestamp'],
+            'attachment_url' => $row['attachment_path'] ?: null,
+            'attachment_type' => $row['attachment_type'] ?: null,
+            'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
             'from_username' => $row['from_username'],
             'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
         ];
@@ -2403,11 +2528,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             border-top: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
             gap: 12px;
-            align-items: center;
+            align-items: flex-end;
+            flex-wrap: wrap;
         }
 
         .chat-input {
-            flex: 1;
+            flex: 1 1 auto;
             padding: 12px 16px;
             border: 1px solid rgba(188, 118, 0, 0.28);
             border-radius: 28px;
@@ -2423,6 +2549,54 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             outline: none;
             border-color: var(--sun-600);
             box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
+        }
+
+        .chat-input-tools {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .attach-button {
+            background: white;
+            border: 1px dashed rgba(240, 180, 0, 0.6);
+            color: var(--sun-700);
+            padding: 10px 16px;
+            border-radius: 24px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+        }
+
+        .attach-button:hover {
+            transform: translateY(-1px);
+            border-color: var(--sun-700);
+            box-shadow: 0 10px 18px rgba(240, 180, 0, 0.18);
+        }
+
+        .attachment-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(251, 191, 36, 0.18);
+            border: 1px solid rgba(240, 180, 0, 0.35);
+            border-radius: 20px;
+            padding: 6px 12px;
+            font-size: 13px;
+            color: var(--sun-800);
+        }
+
+        .attachment-remove {
+            background: none;
+            border: none;
+            color: #b91c1c;
+            font-size: 14px;
+            cursor: pointer;
+            padding: 0;
+        }
+
+        .attachment-remove:hover {
+            color: #7f1d1d;
         }
 
         .send-button {
@@ -2446,6 +2620,30 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             opacity: 0.55;
             cursor: not-allowed;
             box-shadow: none;
+        }
+
+        .attachment-warning {
+            margin: 0 24px 12px;
+            color: #b91c1c;
+            font-size: 13px;
+        }
+
+        .message-attachment {
+            margin-top: 6px;
+        }
+
+        .message-attachment a {
+            display: inline-block;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 6px 18px rgba(60, 42, 0, 0.22);
+            background: rgba(255, 255, 255, 0.85);
+        }
+
+        .message-attachment img {
+            display: block;
+            max-width: 220px;
+            height: auto;
         }
 
         .empty-user-list,
@@ -2637,9 +2835,18 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                 </div>
                 
                 <div class="chat-input-container">
+                    <div class="chat-input-tools">
+                        <button type="button" class="attach-button" id="attachmentButton" title="Bild anhängen">📎 Bild</button>
+                        <input type="file" id="attachmentInput" accept="image/jpeg" class="hidden" />
+                        <div class="attachment-info hidden" id="attachmentInfo">
+                            <span id="attachmentFileName"></span>
+                            <button type="button" class="attachment-remove" id="attachmentClearBtn" aria-label="Anhang entfernen">✕</button>
+                        </div>
+                    </div>
                     <textarea class="chat-input" id="chatInput" placeholder="Nachricht schreiben..." rows="1" maxlength="1000"></textarea>
                     <button class="send-button" id="sendButton">Senden</button>
                 </div>
+                <div class="attachment-warning hidden" id="attachmentWarning"></div>
             </div>
         </div>
     </div>
@@ -3263,10 +3470,18 @@ function renderMessages() {
     container.innerHTML = state.messages.map(msg => {
         const isSent = msg.from_user_id === state.currentUserId;
         const time = new Date(msg.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+        const hasText = typeof msg.message === 'string' && msg.message.trim() !== '';
+        const attachmentUrl = msg.attachment_url;
+
+        const textHtml = hasText ? `<div class="message-text">${escapeHtml(msg.message)}</div>` : '';
+        const attachmentHtml = attachmentUrl
+            ? `<div class="message-attachment"><a href="${escapeAttribute(attachmentUrl)}" target="_blank" rel="noopener"><img src="${escapeAttribute(attachmentUrl)}" alt="Gesendetes Bild"></a></div>`
+            : '';
 
         return `
             <div class="message ${isSent ? 'message-sent' : 'message-received'}">
-                <div class="message-text">${escapeHtml(msg.message)}</div>
+                ${attachmentHtml}
+                ${textHtml}
                 <div class="message-time">${time}</div>
             </div>
         `;
@@ -3284,15 +3499,34 @@ async function sendMessage() {
 
     const message = chatInputEl.value.trim();
 
-    if (!message || !state.selectedUserId) return;
+    clearAttachmentWarning();
+
+    if (attachmentFile) {
+        const fileType = (attachmentFile.type || '').toLowerCase();
+        const fileName = attachmentFile.name || '';
+        const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
+
+        if (!isJpeg) {
+            showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
+            clearAttachmentSelection();
+            return;
+        }
+
+        if (attachmentFile.size > ATTACHMENT_MAX_SIZE) {
+            showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
+            clearAttachmentSelection();
+            return;
+        }
+    }
 
     const formData = new FormData();
     formData.append('action', 'send_message');
     formData.append('to_user_id', state.selectedUserId);
     formData.append('message', message);
 
-    const response = await fetch('', { method: 'POST', body: formData });
-    const result = await response.json();
+    if (attachmentFile) {
+        formData.append('attachment', attachmentFile);
+    }
 
     if (result.success) {
         chatInputEl.value = '';
