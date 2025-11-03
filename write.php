@@ -28,7 +28,8 @@ define('DB_FILE', __DIR__ . '/chat_secure.db');
 define('MESSAGE_RETENTION_HOURS', 24);
 define('LOG_RETENTION_MONTHS', 6);
 define('ONLINE_TIMEOUT_SECONDS', 30);
-define('SSE_RETRY_MS', 1000);
+define('SSE_RETRY_MS', 500);
+define('MAX_MESSAGES_PER_FETCH', 200);
 
 // Rate Limiting
 define('MAX_MESSAGES_PER_MINUTE', 10);
@@ -112,7 +113,17 @@ function getDB() {
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ');
-    
+
+    // User Sessions Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            user_id INTEGER PRIMARY KEY,
+            session_token TEXT NOT NULL,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ');
+
     // Reports Table
     $db->exec('
         CREATE TABLE IF NOT EXISTS reports (
@@ -194,7 +205,8 @@ function getDB() {
     $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
-    
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen)');
+
     return $db;
 }
 
@@ -382,6 +394,9 @@ function cleanupOldData() {
     // Delete old logs (keep 6 months)
     $months = LOG_RETENTION_MONTHS;
     $db->exec("DELETE FROM security_logs WHERE timestamp < datetime('now', '-{$months} months')");
+
+    // Remove stale session placeholders
+    $db->exec("DELETE FROM user_sessions WHERE last_seen < datetime('now', '-5 minutes')");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -424,10 +439,117 @@ function updateOnlineStatus($userId) {
     ');
     $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
     $stmt->execute();
-    
+
     $stmt = $db->prepare('UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = :user_id');
     $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
     $stmt->execute();
+
+    touchUserSession($userId);
+}
+
+function generateSessionToken() {
+    return bin2hex(random_bytes(32));
+}
+
+function startUserSession($userId) {
+    if (!$userId) {
+        return ['allowed' => false, 'error' => 'Ungültige Benutzer-ID'];
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('SELECT session_token, last_seen FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $existing = $result->fetchArray(SQLITE3_ASSOC);
+
+    if ($existing && !empty($existing['last_seen'])) {
+        $secondsSinceLastSeen = time() - strtotime($existing['last_seen']);
+
+        if ($secondsSinceLastSeen < ONLINE_TIMEOUT_SECONDS) {
+            return [
+                'allowed' => false,
+                'error' => 'Du bist bereits auf einem anderen Gerät eingeloggt. Bitte dort zuerst ausloggen oder kurz warten.'
+            ];
+        }
+    }
+
+    $token = generateSessionToken();
+
+    $stmt = $db->prepare('
+        INSERT OR REPLACE INTO user_sessions (user_id, session_token, last_seen)
+        VALUES (:user_id, :token, CURRENT_TIMESTAMP)
+    ');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':token', $token, SQLITE3_TEXT);
+    $stmt->execute();
+
+    $_SESSION['session_token'] = $token;
+
+    return ['allowed' => true, 'token' => $token];
+}
+
+function touchUserSession($userId) {
+    if (!$userId || empty($_SESSION['session_token'])) {
+        return;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('
+        UPDATE user_sessions
+        SET last_seen = CURRENT_TIMESTAMP
+        WHERE user_id = :user_id AND session_token = :token
+    ');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':token', $_SESSION['session_token'], SQLITE3_TEXT);
+    $stmt->execute();
+}
+
+function clearUserSession($userId) {
+    if (!$userId) {
+        return;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('DELETE FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->execute();
+
+    unset($_SESSION['session_token']);
+}
+
+function validateActiveSession() {
+    if (!isLoggedIn()) {
+        return false;
+    }
+
+    $token = $_SESSION['session_token'] ?? null;
+    if (!$token) {
+        return false;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('SELECT session_token, last_seen FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', getCurrentUserId(), SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $session = $result->fetchArray(SQLITE3_ASSOC);
+
+    if (!$session) {
+        return false;
+    }
+
+    if (!hash_equals($session['session_token'], $token)) {
+        return false;
+    }
+
+    if (!empty($session['last_seen'])) {
+        $secondsSinceLastSeen = time() - strtotime($session['last_seen']);
+
+        if ($secondsSinceLastSeen > ONLINE_TIMEOUT_SECONDS * 3) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -512,9 +634,19 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $stmt->bindValue(':birthdate', $birthdate, SQLITE3_TEXT);
         $stmt->bindValue(':age_group', $ageGroup, SQLITE3_TEXT);
         $stmt->execute();
-        
+
         $dbUserId = $db->lastInsertRowID();
-        
+
+        $sessionResult = startUserSession($dbUserId);
+        if (!$sessionResult['allowed']) {
+            logSecurityEvent($dbUserId, 'LOGIN_BLOCKED_DUPLICATE_SESSION', 'REGISTER');
+            echo json_encode([
+                'success' => false,
+                'error' => $sessionResult['error']
+            ]);
+            exit;
+        }
+
         $_SESSION['user_id'] = $dbUserId;
         $_SESSION['username'] = $username;
         $_SESSION['user_display_id'] = $userId;
@@ -567,17 +699,31 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'logout') {
         if (isLoggedIn()) {
-            logSecurityEvent(getCurrentUserId(), 'LOGOUT', '');
+            $currentUserId = getCurrentUserId();
+            logSecurityEvent($currentUserId, 'LOGOUT', '');
+            clearUserSession($currentUserId);
         }
         session_destroy();
         echo json_encode(['success' => true]);
         exit;
     }
-    
+
     // All other actions require login
     if (!isLoggedIn() && !isAdmin()) {
         echo json_encode(['success' => false, 'error' => 'Nicht eingeloggt']);
         exit;
+    }
+
+    if (isLoggedIn() && !isAdmin() && !validateActiveSession()) {
+        $userId = getCurrentUserId();
+        clearUserSession($userId);
+        session_destroy();
+        echo json_encode(['success' => false, 'error' => 'Deine Sitzung ist nicht mehr gültig. Bitte erneut einloggen.']);
+        exit;
+    }
+
+    if (isLoggedIn() && !isAdmin()) {
+        touchUserSession(getCurrentUserId());
     }
     
     // ───────────────────────────────────────────────────────
@@ -714,28 +860,33 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         }
 
         $query = '
-            SELECT
-                m.id,
-                m.from_user_id,
-                m.to_user_id,
-                m.message,
-                m.timestamp,
-                m.is_read,
-                m.is_flagged,
-                u.username as from_username,
-                u.user_id as from_display_id
-            FROM messages m
-            JOIN users u ON m.from_user_id = u.id
-            WHERE 
-                (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
-                OR
-                (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
-            ORDER BY m.timestamp ASC
+            SELECT * FROM (
+                SELECT
+                    m.id,
+                    m.from_user_id,
+                    m.to_user_id,
+                    m.message,
+                    m.timestamp,
+                    m.is_read,
+                    m.is_flagged,
+                    u.username as from_username,
+                    u.user_id as from_display_id
+                FROM messages m
+                JOIN users u ON m.from_user_id = u.id
+                WHERE
+                    (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
+                    OR
+                    (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
+                ORDER BY m.id DESC
+                LIMIT :limit
+            )
+            ORDER BY id ASC
         ';
-        
+
         $stmt = $db->prepare($query);
         $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':other_user_id', $otherUserId, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', MAX_MESSAGES_PER_FETCH, SQLITE3_INTEGER);
         $result = $stmt->execute();
         
         $messages = [];
@@ -1373,16 +1524,22 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     if (!isLoggedIn()) {
         exit;
     }
-    
+
+    if (!validateActiveSession()) {
+        exit;
+    }
+
     header('Content-Type: text/event-stream');
     header('Cache-Control: no-cache');
     header('Connection: keep-alive');
     header('X-Accel-Buffering: no');
-    
+
     $currentUserId = getCurrentUserId();
     $currentAgeGroup = getCurrentAgeGroup();
     $lastMessageId = intval($_GET['last_message_id'] ?? 0);
-    
+
+    touchUserSession($currentUserId);
+
     set_time_limit(0);
     ob_implicit_flush(true);
     while (ob_get_level() > 0) {
@@ -1461,6 +1618,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f59e0b">
     <title>💬 Secure Private Chat</title>
     
     <style>
@@ -1470,14 +1628,31 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             box-sizing: border-box;
         }
         
+        :root {
+            --sun-50: #fff9db;
+            --sun-100: #fef3c7;
+            --sun-200: #fde68a;
+            --sun-300: #fcd34d;
+            --sun-400: #fbbf24;
+            --sun-500: #f59e0b;
+            --sun-600: #d97706;
+            --sun-700: #b45309;
+            --sun-800: #92400e;
+            --sun-900: #78350f;
+            --text-dark: #3d2c00;
+            --text-muted: rgba(61, 44, 0, 0.7);
+        }
+
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #fef08a 0%, #f97316 100%);
+            background-color: #fff9db;
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
             padding: 20px;
+            color: var(--text-dark);
         }
         
         /* ═══════════════════════════════════════════════════════════ */
@@ -1485,7 +1660,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         /* ═══════════════════════════════════════════════════════════ */
         
         .auth-container {
-            background: white;
+            background: #fff9db;
             padding: 40px;
             border-radius: 20px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
@@ -1494,35 +1669,35 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .auth-container h1 {
-            color: #667eea;
+            color: #d97706;
             margin-bottom: 10px;
             font-size: 32px;
             text-align: center;
         }
         
         .auth-container .subtitle {
-            color: #666;
+            color: #7c4a03;
             margin-bottom: 30px;
             text-align: center;
             font-size: 14px;
         }
         
         .auth-container .warning-box {
-            background: #fff3cd;
-            border: 2px solid #ffc107;
+            background: #fef3c7;
+            border: 2px solid #fbbf24;
             border-radius: 10px;
             padding: 15px;
             margin-bottom: 20px;
         }
         
         .auth-container .warning-box h3 {
-            color: #856404;
+            color: #a16207;
             margin-bottom: 10px;
             font-size: 16px;
         }
         
         .auth-container .warning-box ul {
-            color: #856404;
+            color: #a16207;
             margin-left: 20px;
             font-size: 13px;
             line-height: 1.6;
@@ -1534,7 +1709,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         
         .auth-container label {
             display: block;
-            color: #333;
+            color: #7c4a03;
             font-weight: 600;
             margin-bottom: 8px;
             font-size: 14px;
@@ -1545,15 +1720,16 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .auth-container input[type="password"] {
             width: 100%;
             padding: 12px 15px;
-            border: 2px solid #e0e0e0;
+            border: 2px solid #fde68a;
             border-radius: 10px;
             font-size: 15px;
-            transition: border-color 0.3s;
+            transition: border-color 0.3s, box-shadow 0.3s;
         }
         
         .auth-container input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #f59e0b;
+            box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25);
         }
         
         .auth-container .checkbox-group {
@@ -1579,11 +1755,11 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         
         .auth-container .terms-text {
             font-size: 12px;
-            color: #666;
+            color: #7c4a03;
             line-height: 1.6;
             margin-top: 10px;
             padding: 10px;
-            background: #f8f9fa;
+            background: #fff4cc;
             border-radius: 5px;
             max-height: 150px;
             overflow-y: auto;
@@ -1592,18 +1768,19 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .auth-container button {
             width: 100%;
             padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, #fbbf24 0%, #f97316 100%);
+            color: #3d2c00;
             border: none;
             border-radius: 10px;
             font-size: 16px;
             font-weight: bold;
             cursor: pointer;
-            transition: transform 0.2s;
+            transition: transform 0.2s, box-shadow 0.2s;
         }
         
         .auth-container button:hover {
             transform: translateY(-2px);
+            box-shadow: 0 12px 24px rgba(249, 115, 22, 0.25);
         }
         
         .auth-container button:disabled {
@@ -1616,24 +1793,25 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         /* ═══════════════════════════════════════════════════════════ */
 
         .admin-login-container {
-            background: white;
+            background: var(--sun-50);
             padding: 40px;
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(120, 53, 15, 0.25);
             width: 100%;
             max-width: 450px;
+            color: var(--text-dark);
         }
 
         .admin-login-container h1 {
             text-align: center;
             font-size: 28px;
             margin-bottom: 10px;
-            color: #4c51bf;
+            color: var(--sun-800);
         }
 
         .admin-login-container p {
             text-align: center;
-            color: #666;
+            color: var(--text-muted);
             margin-bottom: 25px;
         }
 
@@ -1645,21 +1823,22 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             display: block;
             margin-bottom: 6px;
             font-weight: 600;
-            color: #333;
+            color: var(--sun-800);
         }
 
         .admin-login-container input {
             width: 100%;
             padding: 12px 14px;
             border-radius: 10px;
-            border: 2px solid #e0e0e0;
+            border: 2px solid var(--sun-200);
             font-size: 15px;
-            transition: border-color 0.2s ease;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
 
         .admin-login-container input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.2);
         }
 
         .admin-login-container button {
@@ -1667,16 +1846,17 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             padding: 14px;
             border: none;
             border-radius: 10px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, var(--sun-400) 0%, var(--sun-600) 100%);
+            color: var(--text-dark);
             font-size: 16px;
             font-weight: bold;
             cursor: pointer;
-            transition: transform 0.2s ease;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
 
         .admin-login-container button:hover {
             transform: translateY(-2px);
+            box-shadow: 0 12px 24px rgba(217, 119, 6, 0.28);
         }
 
         .admin-login-container .back-link {
@@ -1685,7 +1865,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
 
         .admin-login-container .back-link a {
-            color: #667eea;
+            color: var(--sun-700);
             text-decoration: none;
             font-weight: 600;
         }
@@ -1697,13 +1877,14 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .admin-dashboard {
             width: 95%;
             max-width: 1400px;
-            background: white;
+            background: var(--sun-50);
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(120, 53, 15, 0.25);
             padding: 30px;
             display: flex;
             flex-direction: column;
             gap: 30px;
+            color: var(--text-dark);
         }
 
         .admin-dashboard-header {
@@ -1715,21 +1896,24 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 
         .admin-dashboard-header h1 {
             font-size: 26px;
-            color: #4c51bf;
+            color: var(--sun-800);
         }
 
         .admin-dashboard-header button {
             padding: 10px 18px;
             border: none;
             border-radius: 8px;
-            background: #ef4444;
+            background: linear-gradient(135deg, #f87171 0%, #ef4444 100%);
             color: white;
             font-weight: 600;
             cursor: pointer;
+            box-shadow: 0 10px 24px rgba(239, 68, 68, 0.35);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
 
         .admin-dashboard-header button:hover {
-            background: #dc2626;
+            transform: translateY(-1px);
+            box-shadow: 0 12px 28px rgba(220, 38, 38, 0.4);
         }
 
         .admin-stats-grid {
@@ -1741,12 +1925,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .admin-stat-card {
             padding: 20px;
             border-radius: 16px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, var(--sun-400) 0%, var(--sun-700) 100%);
+            color: var(--text-dark);
             display: flex;
             flex-direction: column;
             gap: 6px;
-            box-shadow: 0 12px 30px rgba(102, 126, 234, 0.35);
+            box-shadow: 0 12px 30px rgba(250, 204, 21, 0.35);
         }
 
         .admin-stat-card span {
@@ -1766,16 +1950,17 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
 
         .admin-section {
-            background: #f9fafb;
+            background: rgba(255, 255, 255, 0.9);
             border-radius: 16px;
             padding: 20px;
-            border: 1px solid #e5e7eb;
+            border: 1px solid rgba(180, 83, 9, 0.2);
+            box-shadow: inset 0 0 0 1px rgba(255, 200, 92, 0.25);
         }
 
         .admin-section h2 {
             font-size: 18px;
             margin-bottom: 15px;
-            color: #1f2937;
+            color: var(--sun-700);
         }
 
         .admin-table-wrapper {
@@ -1799,7 +1984,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             font-size: 13px;
             text-transform: uppercase;
             letter-spacing: 0.05em;
-            color: #6b7280;
+            color: var(--sun-700);
         }
 
         .admin-action-buttons {
@@ -2267,7 +2452,8 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         .empty-user-list,
         .empty-messages,
         .loading-state,
-        .error-state {
+        .error-state,
+        .chat-state-message {
             text-align: center;
             padding: 30px 20px;
             color: rgba(60, 42, 0, 0.6);
@@ -2284,6 +2470,22 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 
         .error-state {
             color: #c2410c;
+        }
+
+        .chat-state-message.hidden {
+            display: none;
+        }
+
+        .chat-state-message.loading-state {
+            font-style: italic;
+        }
+
+        .chat-state-message.error-state {
+            color: #c2410c;
+        }
+
+        .hidden {
+            display: none !important;
         }
     </style>
 </head>
@@ -2430,6 +2632,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                     <!-- Populated via JS -->
                 </div>
                 
+                <div class="chat-state-message hidden" id="chatStateMessage"></div>
                 <div class="chat-messages" id="chatMessages">
                     <!-- Messages loaded via JS -->
                 </div>
@@ -2798,72 +3001,302 @@ const state = {
     users: [],
     messages: [],
     lastMessageId: 0,
-    eventSource: null
+    eventSource: null,
+    isLoadingUsers: false,
+    isLoadingMessages: false,
+    connectionErrorShown: false
 };
 
-async function loadUsers() {
-    const response = await fetch('?action=get_users');
-    const result = await response.json();
+const userListEl = document.getElementById('userList');
+const userSearchInput = document.getElementById('userSearch');
+const chatWelcomeEl = document.getElementById('chatWelcome');
+const chatMessagesContainerEl = document.getElementById('chatMessagesContainer');
+const chatMessagesEl = document.getElementById('chatMessages');
+const chatStateMessageEl = document.getElementById('chatStateMessage');
+const chatMessagesHeaderEl = document.getElementById('chatMessagesHeader');
+const chatInputEl = document.getElementById('chatInput');
+const sendButtonEl = document.getElementById('sendButton');
+let messageAbortController = null;
 
-    if (result.success) {
-        state.users = result.users;
+async function loadUsers() {
+    if (!userListEl) {
+        return;
+    }
+
+    state.isLoadingUsers = true;
+    renderUserList();
+
+    try {
+        const response = await fetch('?action=get_users');
+        if (!response.ok) {
+            throw new Error('NETZWERK_FEHLER');
+        }
+
+        const result = await response.json();
+
+        if (result.success) {
+            state.users = Array.isArray(result.users) ? result.users : [];
+        } else {
+            throw new Error(result.error || 'Nutzerliste konnte nicht geladen werden.');
+        }
+
+        state.isLoadingUsers = false;
         renderUserList();
+    } catch (error) {
+        console.error('Nutzerliste konnte nicht geladen werden:', error);
+        state.isLoadingUsers = false;
+        if (userListEl) {
+            userListEl.innerHTML = '<div class="error-state">Nutzerliste konnte nicht geladen werden.</div>';
+        }
     }
 }
 
 function renderUserList() {
-    const userList = document.getElementById('userList');
-    const searchTerm = document.getElementById('userSearch').value.toLowerCase();
+    if (!userListEl) {
+        return;
+    }
 
-    const filtered = state.users.filter(u => u.display_name.toLowerCase().includes(searchTerm));
+    const searchTerm = (userSearchInput?.value || '').toLowerCase();
+    const users = Array.isArray(state.users) ? state.users : [];
 
-    userList.innerHTML = filtered.map(user => `
-        <div class="user-item ${user.id === state.selectedUserId ? 'active' : ''}" onclick="selectUser(${user.id}, '${user.display_name}')">
-            <div class="user-avatar">
-                ${user.username.charAt(0).toUpperCase()}
-                <div class="online-indicator ${user.is_online ? '' : 'offline-indicator'}"></div>
-            </div>
-            <div class="user-info-text">
-                <div class="user-name">${user.display_name}</div>
-                <div class="user-status">${user.is_online ? 'Online' : 'Offline'}</div>
-            </div>
-            ${user.unread_count > 0 ? `<div class="unread-badge">${user.unread_count}</div>` : ''}
-        </div>
-    `).join('');
+    if (state.isLoadingUsers && users.length === 0) {
+        userListEl.innerHTML = '<div class="loading-state">Nutzer werden geladen…</div>';
+        return;
+    }
+
+    if (users.length === 0) {
+        userListEl.innerHTML = '<div class="empty-user-list">Noch keine passenden Kontakte verfügbar.</div>';
+        return;
+    }
+
+    const filtered = users.filter(user => user.display_name.toLowerCase().includes(searchTerm));
+
+    if (filtered.length === 0) {
+        userListEl.innerHTML = '<div class="empty-user-list">Keine Treffer für deine Suche.</div>';
+        return;
+    }
+
+    const offlineLimit = 5;
+    const onlineUsers = [];
+    const offlineUsers = [];
+
+    filtered.forEach(user => {
+        if (user.is_online) {
+            onlineUsers.push(user);
+        } else {
+            offlineUsers.push(user);
+        }
+    });
+
+    const limitedUsers = onlineUsers.concat(offlineUsers.slice(0, offlineLimit));
+
+    const fragment = document.createDocumentFragment();
+
+    limitedUsers.forEach(user => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'user-item' + (Number(user.id) === Number(state.selectedUserId) ? ' active' : '');
+        item.dataset.userId = String(user.id);
+        item.dataset.displayName = user.display_name;
+
+        const avatar = document.createElement('div');
+        avatar.className = 'user-avatar';
+        avatar.textContent = (user.username || '?').charAt(0).toUpperCase();
+
+        const indicator = document.createElement('div');
+        indicator.className = 'online-indicator' + (user.is_online ? '' : ' offline-indicator');
+        avatar.appendChild(indicator);
+
+        const infoWrapper = document.createElement('div');
+        infoWrapper.className = 'user-info-text';
+
+        const name = document.createElement('div');
+        name.className = 'user-name';
+        name.textContent = user.display_name;
+
+        const status = document.createElement('div');
+        status.className = 'user-status';
+        status.textContent = user.is_online ? 'Online' : 'Offline';
+
+        infoWrapper.appendChild(name);
+        infoWrapper.appendChild(status);
+
+        item.appendChild(avatar);
+        item.appendChild(infoWrapper);
+
+        if (Number(user.unread_count) > 0) {
+            const unread = document.createElement('div');
+            unread.className = 'unread-badge';
+            unread.textContent = String(user.unread_count);
+            item.appendChild(unread);
+        }
+
+        item.addEventListener('click', () => {
+            selectUser(Number(user.id), user.display_name);
+        });
+
+        fragment.appendChild(item);
+    });
+
+    userListEl.innerHTML = '';
+    userListEl.appendChild(fragment);
+
+    if (offlineUsers.length > offlineLimit) {
+        const hint = document.createElement('div');
+        hint.className = 'user-status';
+        hint.style.textAlign = 'center';
+        hint.style.marginTop = '12px';
+        hint.textContent = 'Weitere Offline-Nutzer werden ausgeblendet.';
+        userListEl.appendChild(hint);
+    }
+}
+
+function renderChatHeader(displayName) {
+    if (!chatMessagesHeaderEl) {
+        return;
+    }
+
+    chatMessagesHeaderEl.innerHTML = '';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'user-avatar';
+    const initial = (displayName?.trim() || '?').charAt(0).toUpperCase();
+    avatar.textContent = initial || '?';
+
+    const info = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'user-name';
+    name.textContent = displayName;
+    info.appendChild(name);
+
+    chatMessagesHeaderEl.appendChild(avatar);
+    chatMessagesHeaderEl.appendChild(info);
+}
+
+function updateChatState(type, message = '') {
+    if (!chatStateMessageEl || !chatMessagesEl) {
+        return;
+    }
+
+    chatStateMessageEl.className = 'chat-state-message';
+
+    if (!type) {
+        chatStateMessageEl.textContent = '';
+        chatStateMessageEl.classList.add('hidden');
+        chatMessagesEl.classList.remove('hidden');
+        return;
+    }
+
+    chatStateMessageEl.textContent = message;
+    chatStateMessageEl.classList.remove('hidden');
+
+    if (type === 'loading') {
+        chatStateMessageEl.classList.add('loading-state');
+    } else if (type === 'error') {
+        chatStateMessageEl.classList.add('error-state');
+    } else if (type === 'empty') {
+        chatStateMessageEl.classList.add('empty-messages');
+    }
+
+    const hideMessages = type === 'loading' || type === 'error' || type === 'empty';
+    chatMessagesEl.classList.toggle('hidden', hideMessages);
 }
 
 function selectUser(userId, displayName) {
     state.selectedUserId = userId;
+    state.messages = [];
 
-    document.getElementById('chatWelcome').style.display = 'none';
-    document.getElementById('chatMessagesContainer').style.display = 'flex';
+    if (chatWelcomeEl) {
+        chatWelcomeEl.style.display = 'none';
+    }
 
-    document.getElementById('chatMessagesHeader').innerHTML = `
-        <div class="user-avatar">${displayName.charAt(0).toUpperCase()}</div>
-        <div><div class="user-name">${displayName}</div></div>
-    `;
+    if (chatMessagesContainerEl) {
+        chatMessagesContainerEl.style.display = 'flex';
+    }
 
-    loadMessages(userId);
+    if (chatMessagesEl) {
+        chatMessagesEl.innerHTML = '';
+        chatMessagesEl.classList.add('hidden');
+    }
+
+    renderChatHeader(displayName);
+    updateChatState('loading', 'Nachrichten werden geladen…');
     renderUserList();
+    loadMessages(userId);
 }
 
 async function loadMessages(userId) {
-    const response = await fetch(`?action=get_messages&user_id=${userId}`);
-    const result = await response.json();
+    if (!userId) {
+        return;
+    }
 
-    if (result.success) {
-        state.messages = result.messages;
-        renderMessages();
-        markAsRead(userId);
+    if (messageAbortController) {
+        messageAbortController.abort();
+    }
 
-        if (result.messages.length > 0) {
-            state.lastMessageId = Math.max(...result.messages.map(m => m.id));
+    const currentController = new AbortController();
+    messageAbortController = currentController;
+
+    state.isLoadingMessages = true;
+    updateChatState('loading', 'Nachrichten werden geladen…');
+
+    try {
+        const response = await fetch(`?action=get_messages&user_id=${userId}`, { signal: currentController.signal });
+        if (!response.ok) {
+            throw new Error('NETZWERK_FEHLER');
+        }
+
+        const result = await response.json();
+
+        if (!result.success) {
+            throw new Error(result.error || 'Nachrichten konnten nicht geladen werden.');
+        }
+
+        state.messages = Array.isArray(result.messages) ? result.messages : [];
+
+        if (state.messages.length > 0) {
+            renderMessages();
+            markAsRead(userId);
+            const newLastMessageId = Math.max(...state.messages.map(m => Number(m.id))); 
+            state.lastMessageId = Math.max(state.lastMessageId, newLastMessageId);
+        } else {
+            if (chatMessagesEl) {
+                chatMessagesEl.innerHTML = '';
+            }
+            updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
+        }
+    } catch (error) {
+        if (error && error.name === 'AbortError') {
+            return;
+        }
+        console.error('Nachrichten konnten nicht geladen werden:', error);
+        state.messages = [];
+        if (chatMessagesEl) {
+            chatMessagesEl.innerHTML = '';
+        }
+        const errorMessage = (error && error.message && error.message !== 'NETZWERK_FEHLER')
+            ? error.message
+            : 'Nachrichten konnten nicht geladen werden. Bitte versuche es erneut.';
+        updateChatState('error', errorMessage);
+    } finally {
+        if (messageAbortController === currentController) {
+            messageAbortController = null;
+            state.isLoadingMessages = false;
         }
     }
 }
 
 function renderMessages() {
-    const container = document.getElementById('chatMessages');
+    const container = chatMessagesEl;
+
+    if (!container) {
+        return;
+    }
+
+    if (!Array.isArray(state.messages) || state.messages.length === 0) {
+        container.innerHTML = '';
+        return;
+    }
 
     container.innerHTML = state.messages.map(msg => {
         const isSent = msg.from_user_id === state.currentUserId;
@@ -2877,12 +3310,17 @@ function renderMessages() {
         `;
     }).join('');
 
+    container.classList.remove('hidden');
     container.scrollTop = container.scrollHeight;
+    updateChatState(null);
 }
 
 async function sendMessage() {
-    const input = document.getElementById('chatInput');
-    const message = input.value.trim();
+    if (!chatInputEl) {
+        return;
+    }
+
+    const message = chatInputEl.value.trim();
 
     if (!message || !state.selectedUserId) return;
 
@@ -2895,7 +3333,8 @@ async function sendMessage() {
     const result = await response.json();
 
     if (result.success) {
-        input.value = '';
+        chatInputEl.value = '';
+        chatInputEl.dispatchEvent(new Event('input'));
     } else {
         alert(result.error);
     }
@@ -2911,21 +3350,47 @@ async function markAsRead(userId) {
 }
 
 function startSSE() {
-    state.eventSource = new EventSource(`?stream=events&last_message_id=${state.lastMessageId}`);
+    if (state.eventSource) {
+        state.eventSource.close();
+    }
+
+    const url = `?stream=events&last_message_id=${state.lastMessageId}&t=${Date.now()}`;
+    state.eventSource = new EventSource(url);
+
+    state.eventSource.onopen = () => {
+        state.connectionErrorShown = false;
+
+        if (!state.selectedUserId) {
+            return;
+        }
+
+        if (state.isLoadingMessages) {
+            return;
+        }
+
+        if (state.messages.length === 0) {
+            updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
+        } else {
+            updateChatState(null);
+        }
+    };
 
     state.eventSource.onmessage = (event) => {
+        state.connectionErrorShown = false;
         const data = JSON.parse(event.data);
 
         if (data.type === 'messages' && data.messages) {
             data.messages.forEach(msg => {
-                if (msg.id > state.lastMessageId) {
-                    state.lastMessageId = msg.id;
+                const messageId = Number(msg.id);
+
+                if (messageId > state.lastMessageId) {
+                    state.lastMessageId = messageId;
 
                     if (state.selectedUserId &&
                         ((msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
                          (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId))) {
 
-                        if (!state.messages.find(m => m.id === msg.id)) {
+                        if (!state.messages.find(m => Number(m.id) === messageId)) {
                             state.messages.push(msg);
                             renderMessages();
 
@@ -2940,6 +3405,22 @@ function startSSE() {
             loadUsers();
         }
     };
+
+    state.eventSource.onerror = () => {
+        if (!state.connectionErrorShown) {
+            state.connectionErrorShown = true;
+            console.warn('SSE-Verbindung unterbrochen, versuche Neuverbindung.');
+            if (state.selectedUserId && !state.isLoadingMessages) {
+                updateChatState('error', 'Live-Verbindung unterbrochen. Erneuter Verbindungsversuch…');
+            }
+        }
+
+        if (state.eventSource) {
+            state.eventSource.close();
+        }
+
+        setTimeout(startSSE, 500);
+    };
 }
 
 function escapeHtml(text) {
@@ -2948,22 +3429,25 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-document.getElementById('sendButton').addEventListener('click', sendMessage);
-document.getElementById('chatInput').addEventListener('keypress', (e) => {
+sendButtonEl?.addEventListener('click', sendMessage);
+
+chatInputEl?.addEventListener('keypress', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
     }
 });
-document.getElementById('userSearch').addEventListener('input', renderUserList);
-document.getElementById('logoutBtn').addEventListener('click', async () => {
+
+userSearchInput?.addEventListener('input', () => renderUserList());
+
+document.getElementById('logoutBtn')?.addEventListener('click', async () => {
     const formData = new FormData();
     formData.append('action', 'logout');
     await fetch('', { method: 'POST', body: formData });
     window.location.reload();
 });
 
-document.getElementById('chatInput').addEventListener('input', function() {
+chatInputEl?.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 100) + 'px';
 });
