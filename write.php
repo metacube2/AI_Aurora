@@ -28,7 +28,8 @@ define('DB_FILE', __DIR__ . '/chat_secure.db');
 define('MESSAGE_RETENTION_HOURS', 24);
 define('LOG_RETENTION_MONTHS', 6);
 define('ONLINE_TIMEOUT_SECONDS', 30);
-define('SSE_RETRY_MS', 1000);
+define('SSE_RETRY_MS', 500);
+define('MAX_MESSAGES_PER_FETCH', 200);
 
 // Rate Limiting
 define('MAX_MESSAGES_PER_MINUTE', 10);
@@ -112,7 +113,17 @@ function getDB() {
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ');
-    
+
+    // User Sessions Table
+    $db->exec('
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            user_id INTEGER PRIMARY KEY,
+            session_token TEXT NOT NULL,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ');
+
     // Reports Table
     $db->exec('
         CREATE TABLE IF NOT EXISTS reports (
@@ -194,7 +205,8 @@ function getDB() {
     $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
-    
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen)');
+
     return $db;
 }
 
@@ -382,6 +394,9 @@ function cleanupOldData() {
     // Delete old logs (keep 6 months)
     $months = LOG_RETENTION_MONTHS;
     $db->exec("DELETE FROM security_logs WHERE timestamp < datetime('now', '-{$months} months')");
+
+    // Remove stale session placeholders
+    $db->exec("DELETE FROM user_sessions WHERE last_seen < datetime('now', '-5 minutes')");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -424,10 +439,117 @@ function updateOnlineStatus($userId) {
     ');
     $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
     $stmt->execute();
-    
+
     $stmt = $db->prepare('UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = :user_id');
     $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
     $stmt->execute();
+
+    touchUserSession($userId);
+}
+
+function generateSessionToken() {
+    return bin2hex(random_bytes(32));
+}
+
+function startUserSession($userId) {
+    if (!$userId) {
+        return ['allowed' => false, 'error' => 'Ungültige Benutzer-ID'];
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('SELECT session_token, last_seen FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $existing = $result->fetchArray(SQLITE3_ASSOC);
+
+    if ($existing && !empty($existing['last_seen'])) {
+        $secondsSinceLastSeen = time() - strtotime($existing['last_seen']);
+
+        if ($secondsSinceLastSeen < ONLINE_TIMEOUT_SECONDS) {
+            return [
+                'allowed' => false,
+                'error' => 'Du bist bereits auf einem anderen Gerät eingeloggt. Bitte dort zuerst ausloggen oder kurz warten.'
+            ];
+        }
+    }
+
+    $token = generateSessionToken();
+
+    $stmt = $db->prepare('
+        INSERT OR REPLACE INTO user_sessions (user_id, session_token, last_seen)
+        VALUES (:user_id, :token, CURRENT_TIMESTAMP)
+    ');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':token', $token, SQLITE3_TEXT);
+    $stmt->execute();
+
+    $_SESSION['session_token'] = $token;
+
+    return ['allowed' => true, 'token' => $token];
+}
+
+function touchUserSession($userId) {
+    if (!$userId || empty($_SESSION['session_token'])) {
+        return;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('
+        UPDATE user_sessions
+        SET last_seen = CURRENT_TIMESTAMP
+        WHERE user_id = :user_id AND session_token = :token
+    ');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':token', $_SESSION['session_token'], SQLITE3_TEXT);
+    $stmt->execute();
+}
+
+function clearUserSession($userId) {
+    if (!$userId) {
+        return;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('DELETE FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+    $stmt->execute();
+
+    unset($_SESSION['session_token']);
+}
+
+function validateActiveSession() {
+    if (!isLoggedIn()) {
+        return false;
+    }
+
+    $token = $_SESSION['session_token'] ?? null;
+    if (!$token) {
+        return false;
+    }
+
+    $db = getDB();
+    $stmt = $db->prepare('SELECT session_token, last_seen FROM user_sessions WHERE user_id = :user_id');
+    $stmt->bindValue(':user_id', getCurrentUserId(), SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $session = $result->fetchArray(SQLITE3_ASSOC);
+
+    if (!$session) {
+        return false;
+    }
+
+    if (!hash_equals($session['session_token'], $token)) {
+        return false;
+    }
+
+    if (!empty($session['last_seen'])) {
+        $secondsSinceLastSeen = time() - strtotime($session['last_seen']);
+
+        if ($secondsSinceLastSeen > ONLINE_TIMEOUT_SECONDS * 3) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -512,9 +634,19 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $stmt->bindValue(':birthdate', $birthdate, SQLITE3_TEXT);
         $stmt->bindValue(':age_group', $ageGroup, SQLITE3_TEXT);
         $stmt->execute();
-        
+
         $dbUserId = $db->lastInsertRowID();
-        
+
+        $sessionResult = startUserSession($dbUserId);
+        if (!$sessionResult['allowed']) {
+            logSecurityEvent($dbUserId, 'LOGIN_BLOCKED_DUPLICATE_SESSION', 'REGISTER');
+            echo json_encode([
+                'success' => false,
+                'error' => $sessionResult['error']
+            ]);
+            exit;
+        }
+
         $_SESSION['user_id'] = $dbUserId;
         $_SESSION['username'] = $username;
         $_SESSION['user_display_id'] = $userId;
@@ -567,17 +699,31 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'logout') {
         if (isLoggedIn()) {
-            logSecurityEvent(getCurrentUserId(), 'LOGOUT', '');
+            $currentUserId = getCurrentUserId();
+            logSecurityEvent($currentUserId, 'LOGOUT', '');
+            clearUserSession($currentUserId);
         }
         session_destroy();
         echo json_encode(['success' => true]);
         exit;
     }
-    
+
     // All other actions require login
     if (!isLoggedIn() && !isAdmin()) {
         echo json_encode(['success' => false, 'error' => 'Nicht eingeloggt']);
         exit;
+    }
+
+    if (isLoggedIn() && !isAdmin() && !validateActiveSession()) {
+        $userId = getCurrentUserId();
+        clearUserSession($userId);
+        session_destroy();
+        echo json_encode(['success' => false, 'error' => 'Deine Sitzung ist nicht mehr gültig. Bitte erneut einloggen.']);
+        exit;
+    }
+
+    if (isLoggedIn() && !isAdmin()) {
+        touchUserSession(getCurrentUserId());
     }
     
     // ───────────────────────────────────────────────────────
@@ -714,28 +860,33 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         }
 
         $query = '
-            SELECT
-                m.id,
-                m.from_user_id,
-                m.to_user_id,
-                m.message,
-                m.timestamp,
-                m.is_read,
-                m.is_flagged,
-                u.username as from_username,
-                u.user_id as from_display_id
-            FROM messages m
-            JOIN users u ON m.from_user_id = u.id
-            WHERE 
-                (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
-                OR
-                (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
-            ORDER BY m.timestamp ASC
+            SELECT * FROM (
+                SELECT
+                    m.id,
+                    m.from_user_id,
+                    m.to_user_id,
+                    m.message,
+                    m.timestamp,
+                    m.is_read,
+                    m.is_flagged,
+                    u.username as from_username,
+                    u.user_id as from_display_id
+                FROM messages m
+                JOIN users u ON m.from_user_id = u.id
+                WHERE
+                    (m.from_user_id = :current_user_id AND m.to_user_id = :other_user_id)
+                    OR
+                    (m.from_user_id = :other_user_id AND m.to_user_id = :current_user_id)
+                ORDER BY m.id DESC
+                LIMIT :limit
+            )
+            ORDER BY id ASC
         ';
-        
+
         $stmt = $db->prepare($query);
         $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':other_user_id', $otherUserId, SQLITE3_INTEGER);
+        $stmt->bindValue(':limit', MAX_MESSAGES_PER_FETCH, SQLITE3_INTEGER);
         $result = $stmt->execute();
         
         $messages = [];
@@ -1373,16 +1524,22 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     if (!isLoggedIn()) {
         exit;
     }
-    
+
+    if (!validateActiveSession()) {
+        exit;
+    }
+
     header('Content-Type: text/event-stream');
     header('Cache-Control: no-cache');
     header('Connection: keep-alive');
     header('X-Accel-Buffering: no');
-    
+
     $currentUserId = getCurrentUserId();
     $currentAgeGroup = getCurrentAgeGroup();
     $lastMessageId = intval($_GET['last_message_id'] ?? 0);
-    
+
+    touchUserSession($currentUserId);
+
     set_time_limit(0);
     ob_implicit_flush(true);
     while (ob_get_level() > 0) {
@@ -1461,6 +1618,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f59e0b">
     <title>💬 Secure Private Chat</title>
     
     <style>
