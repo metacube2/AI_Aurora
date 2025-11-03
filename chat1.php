@@ -339,6 +339,20 @@ function logSecurityEvent($userId, $action, $details = '') {
     $stmt->execute();
 }
 
+function canUsersChatByAge($ageGroupA, $ageGroupB) {
+    if (!$ageGroupA || !$ageGroupB) {
+        return false;
+    }
+
+    // Wenn einer minderjährig ist, müssen beide minderjährig sein
+    if ($ageGroupA === 'U18' || $ageGroupB === 'U18') {
+        return $ageGroupA === 'U18' && $ageGroupB === 'U18';
+    }
+
+    // Volljährige dürfen miteinander chatten
+    return true;
+}
+
 function isBlocked($userId, $otherUserId) {
     $db = getDB();
     $stmt = $db->prepare('
@@ -585,48 +599,59 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $currentAgeGroup = getCurrentAgeGroup();
         
         $query = '
-            SELECT 
+            SELECT
                 u.id,
                 u.username,
                 u.user_id as display_id,
                 u.age_group,
                 u.last_seen,
-                CASE 
-                    WHEN os.last_ping IS NOT NULL 
+                CASE
+                    WHEN os.last_ping IS NOT NULL
                     AND (julianday("now") - julianday(os.last_ping)) * 86400 < ' . ONLINE_TIMEOUT_SECONDS . '
-                    THEN 1 
-                    ELSE 0 
+                    THEN 1
+                    ELSE 0
                 END as is_online,
                 (
-                    SELECT COUNT(*) 
-                    FROM messages 
-                    WHERE from_user_id = u.id 
-                    AND to_user_id = :current_user_id 
+                    SELECT COUNT(*)
+                    FROM messages
+                    WHERE from_user_id = u.id
+                    AND to_user_id = :current_user_id
                     AND is_read = 0
                 ) as unread_count,
                 (
-                    SELECT COUNT(*) 
-                    FROM blocks 
-                    WHERE blocker_id = :current_user_id 
+                    SELECT COUNT(*)
+                    FROM blocks
+                    WHERE blocker_id = :current_user_id
                     AND blocked_id = u.id
                 ) as is_blocked_by_me,
                 (
-                    SELECT COUNT(*) 
-                    FROM blocks 
-                    WHERE blocker_id = u.id 
+                    SELECT COUNT(*)
+                    FROM blocks
+                    WHERE blocker_id = u.id
                     AND blocked_id = :current_user_id
                 ) as has_blocked_me
             FROM users u
             LEFT JOIN online_status os ON u.id = os.user_id
             WHERE u.id != :current_user_id
             AND u.is_banned = 0
-            AND u.age_group = :age_group
-            ORDER BY is_online DESC, u.username ASC
         ';
-        
+
+        if ($currentAgeGroup === 'U18') {
+            $query .= ' AND u.age_group = :allowed_group';
+        } else {
+            $query .= ' AND u.age_group != :blocked_group';
+        }
+
+        $query .= ' ORDER BY is_online DESC, u.username ASC';
+
         $stmt = $db->prepare($query);
         $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-        $stmt->bindValue(':age_group', $currentAgeGroup, SQLITE3_TEXT);
+
+        if ($currentAgeGroup === 'U18') {
+            $stmt->bindValue(':allowed_group', 'U18', SQLITE3_TEXT);
+        } else {
+            $stmt->bindValue(':blocked_group', 'U18', SQLITE3_TEXT);
+        }
         $result = $stmt->execute();
         
         $users = [];
@@ -656,23 +681,40 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'get_messages') {
         $otherUserId = intval($_GET['user_id'] ?? 0);
-        
+
         if ($otherUserId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
+
         // Check if blocked
         if (isBlocked(getCurrentUserId(), $otherUserId)) {
             echo json_encode(['success' => false, 'error' => 'Chat nicht verfügbar']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
-        
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $otherUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$otherUser) {
+            echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "GET_MESSAGES -> User $otherUserId");
+            echo json_encode(['success' => false, 'error' => 'Chat zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         $query = '
-            SELECT 
+            SELECT
                 m.id,
                 m.from_user_id,
                 m.to_user_id,
@@ -746,7 +788,23 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $db = getDB();
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
-        
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $toUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $targetUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$targetUser) {
+            echo json_encode(['success' => false, 'error' => 'Empfänger nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $targetUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "SEND_MESSAGE -> User $toUserId");
+            echo json_encode(['success' => false, 'error' => 'Nachrichten zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         // Rate Limiting
         $rateLimitCheck = checkRateLimit($currentUserId, $currentAgeGroup);
         if (!$rateLimitCheck['allowed']) {
@@ -853,14 +911,31 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
-        
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        $stmt = $db->prepare('SELECT age_group FROM users WHERE id = :user_id AND is_banned = 0');
+        $stmt->bindValue(':user_id', $otherUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $otherUser = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$otherUser) {
+            echo json_encode(['success' => false, 'error' => 'Benutzer nicht gefunden']);
+            exit;
+        }
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherUser['age_group'])) {
+            logSecurityEvent($currentUserId, 'AGE_RESTRICTION_BLOCKED', "MARK_READ -> User $otherUserId");
+            echo json_encode(['success' => false, 'error' => 'Aktion zwischen Altersgruppen nicht erlaubt']);
+            exit;
+        }
+
         $stmt = $db->prepare('
-            UPDATE messages 
-            SET is_read = 1 
-            WHERE from_user_id = :other_user_id 
+            UPDATE messages
+            SET is_read = 1
+            WHERE from_user_id = :other_user_id
             AND to_user_id = :current_user_id 
             AND is_read = 0
         ');
@@ -1305,29 +1380,39 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     header('X-Accel-Buffering: no');
     
     $currentUserId = getCurrentUserId();
+    $currentAgeGroup = getCurrentAgeGroup();
     $lastMessageId = intval($_GET['last_message_id'] ?? 0);
     
     set_time_limit(0);
     ob_implicit_flush(true);
-    ob_end_flush();
+    while (ob_get_level() > 0) {
+        @ob_end_flush();
+    }
+
+    echo ": connected\n\n";
+    echo "retry: " . SSE_RETRY_MS . "\n\n";
+    flush();
     
     $db = getDB();
     
     $stmt = $db->prepare('
-        SELECT 
+        SELECT
             m.id,
             m.from_user_id,
             m.to_user_id,
             m.message,
             m.timestamp,
-            u.username as from_username,
-            u.user_id as from_display_id
+            uf.username as from_username,
+            uf.user_id as from_display_id,
+            uf.age_group as from_age_group,
+            ut.age_group as to_age_group
         FROM messages m
-        JOIN users u ON m.from_user_id = u.id
+        JOIN users uf ON m.from_user_id = uf.id
+        JOIN users ut ON m.to_user_id = ut.id
         WHERE m.id > :last_message_id
         AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
         AND NOT EXISTS (
-            SELECT 1 FROM blocks 
+            SELECT 1 FROM blocks
             WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
             OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
         )
@@ -1339,6 +1424,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     
     $messages = [];
     while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+        if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+            continue;
+        }
+
         $messages[] = [
             'id' => $row['id'],
             'from_user_id' => $row['from_user_id'],
@@ -1786,7 +1877,31 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             display: none;
             font-size: 14px;
         }
-        
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 16px 30px rgba(188, 118, 0, 0.4);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
         .admin-link {
             text-align: center;
             margin-top: 20px;
@@ -1794,11 +1909,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .admin-link a {
-            color: #667eea;
+            color: var(--sun-700);
             text-decoration: none;
         }
-        
+
         .admin-link a:hover {
+            color: var(--sun-900);
             text-decoration: underline;
         }
         
@@ -1811,19 +1927,19 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             width: 95%;
             max-width: 1400px;
             height: 90vh;
-            background: white;
+            background: var(--sun-50);
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 60px rgba(60, 42, 0, 0.25);
             overflow: hidden;
             grid-template-columns: 350px 1fr;
-            grid-template-rows: 60px 1fr;
+            grid-template-rows: 70px 1fr;
         }
-        
+
         .chat-header {
             grid-column: 1 / -1;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-900) 100%);
             color: white;
-            padding: 0 20px;
+            padding: 0 24px;
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -1848,119 +1964,137 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         }
         
         .chat-header .age-badge {
-            background: rgba(255,255,255,0.3);
-            padding: 4px 10px;
-            border-radius: 12px;
+            background: rgba(255,255,255,0.28);
+            padding: 4px 12px;
+            border-radius: 16px;
             font-size: 12px;
+            letter-spacing: 0.02em;
         }
-        
+
         .chat-header button {
-            background: rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.25);
             color: white;
             border: none;
-            padding: 8px 16px;
-            border-radius: 5px;
+            padding: 8px 18px;
+            border-radius: 18px;
             cursor: pointer;
-            transition: background 0.3s;
+            transition: background 0.2s ease, transform 0.2s ease;
             font-size: 13px;
+            font-weight: 600;
         }
-        
+
         .chat-header button:hover {
-            background: rgba(255,255,255,0.3);
+            background: rgba(255,255,255,0.35);
+            transform: translateY(-1px);
         }
         
         /* SIDEBAR */
         .sidebar {
-            background: #f5f5f5;
-            border-right: 1px solid #e0e0e0;
+            background: rgba(255,255,255,0.92);
+            border-right: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
             flex-direction: column;
         }
-        
+
         .sidebar-search {
             padding: 15px;
-            background: white;
-            border-bottom: 1px solid #e0e0e0;
+            background: var(--sun-50);
+            border-bottom: 1px solid rgba(188, 118, 0, 0.15);
         }
-        
+
         .sidebar-search input {
             width: 100%;
             padding: 10px 15px;
-            border: 1px solid #e0e0e0;
+            border: 1px solid rgba(188, 118, 0, 0.3);
             border-radius: 20px;
             font-size: 14px;
+            background: white;
+            color: var(--text-dark);
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
-        
+
         .sidebar-search input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.25);
         }
-        
+
         .user-list {
             flex: 1;
             overflow-y: auto;
+            background: transparent;
         }
-        
+
         .user-item {
             padding: 15px 20px;
-            border-bottom: 1px solid #e0e0e0;
+            border: none;
+            border-bottom: 1px solid rgba(188, 118, 0, 0.12);
             cursor: pointer;
-            transition: background 0.2s;
+            transition: background 0.2s ease, transform 0.2s ease;
             display: flex;
             align-items: center;
             gap: 12px;
             position: relative;
+            width: 100%;
+            text-align: left;
+            background: transparent;
+            font: inherit;
         }
-        
-        .user-item:hover {
-            background: #e8e8e8;
+
+        .user-item:hover,
+        .user-item:focus-visible {
+            background: rgba(255, 208, 70, 0.18);
+            outline: none;
         }
-        
+
         .user-item.active {
-            background: #667eea;
-            color: white;
+            background: rgba(255, 208, 70, 0.32);
+            color: var(--text-dark);
+            box-shadow: inset 0 0 0 1px rgba(240, 180, 0, 0.35);
         }
-        
+
         .user-avatar {
             width: 45px;
             height: 45px;
             border-radius: 50%;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-weight: bold;
+            font-weight: 700;
             font-size: 16px;
             flex-shrink: 0;
             position: relative;
+            box-shadow: 0 6px 14px rgba(188, 118, 0, 0.3);
         }
-        
+
         .user-item.active .user-avatar {
             background: white;
-            color: #667eea;
+            color: var(--sun-700);
+            box-shadow: 0 0 0 2px rgba(240, 180, 0, 0.45);
         }
-        
+
         .online-indicator {
             width: 12px;
             height: 12px;
             border-radius: 50%;
-            background: #4caf50;
+            background: #3ac57a;
             border: 2px solid white;
             position: absolute;
             bottom: 0;
             right: 0;
         }
-        
+
         .offline-indicator {
-            background: #999;
+            background: #b5b5b5;
         }
-        
+
         .user-info-text {
             flex: 1;
             min-width: 0;
         }
-        
+
         .user-name {
             font-weight: 600;
             font-size: 14px;
@@ -1969,18 +2103,18 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             overflow: hidden;
             text-overflow: ellipsis;
         }
-        
+
         .user-status {
             font-size: 12px;
-            color: #999;
+            color: rgba(60, 42, 0, 0.55);
         }
-        
+
         .user-item.active .user-status {
-            color: rgba(255,255,255,0.8);
+            color: rgba(60, 42, 0, 0.75);
         }
         
         .unread-badge {
-            background: #f44336;
+            background: var(--sun-700);
             color: white;
             border-radius: 12px;
             padding: 2px 8px;
@@ -1989,33 +2123,36 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             min-width: 20px;
             text-align: center;
         }
-        
+
         /* CHAT AREA */
         .chat-area {
             display: flex;
             flex-direction: column;
-            background: #e5ddd5;
+            background: var(--sun-50);
         }
-        
+
         .chat-welcome {
             flex: 1;
             display: flex;
             align-items: center;
             justify-content: center;
             flex-direction: column;
-            color: #999;
+            color: rgba(60, 42, 0, 0.55);
             font-size: 18px;
+            text-align: center;
+            padding: 0 30px;
         }
-        
+
         .chat-welcome-icon {
             font-size: 80px;
             margin-bottom: 20px;
         }
-        
+
         .chat-messages-container {
             display: none;
             flex-direction: column;
             height: 100%;
+            background: rgba(255,255,255,0.6);
         }
         
         .chat-messages-header {
@@ -2026,95 +2163,127 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             align-items: center;
             gap: 12px;
         }
-        
+
         .chat-messages {
             flex: 1;
             overflow-y: auto;
-            padding: 20px;
+            padding: 24px;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 12px;
         }
-        
+
         .message {
             max-width: 65%;
-            padding: 10px 15px;
-            border-radius: 10px;
+            padding: 12px 16px;
+            border-radius: 14px;
             word-wrap: break-word;
             animation: slideIn 0.3s ease;
+            box-shadow: 0 6px 16px rgba(60, 42, 0, 0.08);
         }
-        
+
         @keyframes slideIn {
             from { opacity: 0; transform: translateY(10px); }
             to { opacity: 1; transform: translateY(0); }
         }
-        
+
         .message-received {
             align-self: flex-start;
             background: white;
-            border-bottom-left-radius: 2px;
+            border: 1px solid rgba(188, 118, 0, 0.12);
+            border-bottom-left-radius: 4px;
         }
-        
+
         .message-sent {
             align-self: flex-end;
-            background: #dcf8c6;
-            border-bottom-right-radius: 2px;
+            background: var(--sun-200);
+            color: var(--text-dark);
+            border-bottom-right-radius: 4px;
         }
-        
+
         .message-text {
-            margin-bottom: 5px;
-            line-height: 1.4;
+            margin-bottom: 6px;
+            line-height: 1.5;
         }
-        
+
         .message-time {
             font-size: 11px;
-            color: #999;
+            color: rgba(60, 42, 0, 0.55);
             text-align: right;
         }
-        
+
         /* Chat Input */
         .chat-input-container {
-            background: white;
-            padding: 15px 20px;
-            border-top: 1px solid #e0e0e0;
+            background: rgba(255,255,255,0.92);
+            padding: 16px 24px;
+            border-top: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
-            gap: 10px;
+            gap: 12px;
             align-items: center;
         }
-        
+
         .chat-input {
             flex: 1;
-            padding: 12px 15px;
-            border: 1px solid #e0e0e0;
-            border-radius: 25px;
+            padding: 12px 16px;
+            border: 1px solid rgba(188, 118, 0, 0.28);
+            border-radius: 28px;
             font-size: 15px;
             resize: none;
-            max-height: 100px;
+            max-height: 120px;
+            background: white;
+            color: var(--text-dark);
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
-        
+
         .chat-input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--sun-600);
+            box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
         }
-        
+
         .send-button {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--sun-500) 0%, var(--sun-700) 100%);
             color: white;
             border: none;
-            padding: 12px 24px;
-            border-radius: 25px;
+            padding: 12px 28px;
+            border-radius: 28px;
             cursor: pointer;
-            font-weight: bold;
-            transition: transform 0.2s;
+            font-weight: 600;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            box-shadow: 0 12px 24px rgba(188, 118, 0, 0.35);
         }
-        
+
         .send-button:hover {
             transform: translateY(-2px);
+            box-shadow: 0 16px 28px rgba(188, 118, 0, 0.4);
         }
-        
+
         .send-button:disabled {
-            opacity: 0.5;
+            opacity: 0.55;
             cursor: not-allowed;
+            box-shadow: none;
+        }
+
+        .empty-user-list,
+        .empty-messages,
+        .loading-state,
+        .error-state {
+            text-align: center;
+            padding: 30px 20px;
+            color: rgba(60, 42, 0, 0.6);
+            font-size: 14px;
+        }
+
+        .empty-user-list {
+            padding: 40px 20px;
+        }
+
+        .loading-state {
+            font-style: italic;
+        }
+
+        .error-state {
+            color: #c2410c;
         }
     </style>
 </head>
@@ -2775,7 +2944,7 @@ function startSSE() {
 
 function escapeHtml(text) {
     const div = document.createElement('div');
-    div.textContent = text;
+    div.textContent = text ?? '';
     return div.innerHTML;
 }
 
