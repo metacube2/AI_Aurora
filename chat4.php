@@ -263,6 +263,20 @@ function getAgeGroup($birthdate) {
     return $age < 18 ? 'U18' : 'O18';
 }
 
+function resolveStoredAgeGroup($storedAgeGroup, $birthdate) {
+    $storedAgeGroup = is_string($storedAgeGroup) ? strtoupper(trim($storedAgeGroup)) : '';
+
+    if ($storedAgeGroup === 'U18' || $storedAgeGroup === 'O18') {
+        return $storedAgeGroup;
+    }
+
+    if (!empty($birthdate)) {
+        return getAgeGroup($birthdate);
+    }
+
+    return 'O18';
+}
+
 function checkKeywordBlacklist($message) {
     global $KEYWORD_BLACKLIST;
     
@@ -886,6 +900,7 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
                 u.id,
                 u.username,
                 u.user_id as display_id,
+                u.birthdate,
                 u.age_group,
                 u.last_seen,
                 CASE
@@ -920,9 +935,9 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         ';
 
         if ($currentAgeGroup === 'U18') {
-            $query .= ' AND u.age_group = :allowed_group';
+            $query .= ' AND (u.age_group = :allowed_group)';
         } else {
-            $query .= ' AND u.age_group != :blocked_group';
+            $query .= ' AND (u.age_group != :blocked_group OR u.age_group IS NULL)';
         }
 
         $query .= ' ORDER BY is_online DESC, u.username ASC';
@@ -938,24 +953,53 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $result = $stmt->execute();
         
         $users = [];
+        $rawCount = 0;
         while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $rawCount++;
+
+            $resolvedAgeGroup = resolveStoredAgeGroup($row['age_group'] ?? '', $row['birthdate'] ?? '');
+
+            if (!canUsersChatByAge($currentAgeGroup, $resolvedAgeGroup)) {
+                continue;
+            }
+
             // Don't show users who blocked me or I blocked
             if ($row['is_blocked_by_me'] > 0 || $row['has_blocked_me'] > 0) {
                 continue;
             }
-            
+
             $users[] = [
                 'id' => $row['id'],
                 'username' => $row['username'],
                 'display_id' => $row['display_id'],
                 'display_name' => $row['username'] . '#' . $row['display_id'],
-                'age_group' => $row['age_group'],
+                'age_group' => $resolvedAgeGroup,
                 'is_online' => $row['is_online'],
                 'unread_count' => $row['unread_count']
             ];
         }
-        
-        echo json_encode(['success' => true, 'users' => $users]);
+
+        if ($rawCount > 0 && count($users) === 0) {
+            logSecurityEvent(
+                $currentUserId,
+                'GET_USERS_FILTERED_EMPTY',
+                sprintf(
+                    'Raw: %d | AgeGroup: %s',
+                    $rawCount,
+                    $currentAgeGroup
+                )
+            );
+        }
+
+        echo json_encode([
+            'success' => true,
+            'users' => $users,
+            'diagnostics' => [
+                'raw_count' => $rawCount,
+                'filtered_count' => count($users),
+                'current_age_group' => $currentAgeGroup
+            ]
+        ]);
         exit;
     }
     
@@ -1856,9 +1900,16 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     echo ": connected\n\n";
     echo "retry: " . SSE_RETRY_MS . "\n\n";
     flush();
-    
-    $db = getDB();
-    
+
+    $lastPingTime = time();
+
+    while (true) {
+        if (connection_aborted()) {
+            break;
+        }
+
+        $db = getDB();
+
         $stmt = $db->prepare('
             SELECT
                 m.id,
@@ -1873,52 +1924,61 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                 uf.user_id as from_display_id,
                 uf.age_group as from_age_group,
                 ut.age_group as to_age_group
-        FROM messages m
-        JOIN users uf ON m.from_user_id = uf.id
-        JOIN users ut ON m.to_user_id = ut.id
-        WHERE m.id > :last_message_id
-        AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
-        AND NOT EXISTS (
-            SELECT 1 FROM blocks
-            WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
-            OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
-        )
-        ORDER BY m.id ASC
-    ');
-    $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
-    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $messages = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+            FROM messages m
+            JOIN users uf ON m.from_user_id = uf.id
+            JOIN users ut ON m.to_user_id = ut.id
+            WHERE m.id > :last_message_id
+            AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
+            AND NOT EXISTS (
+                SELECT 1 FROM blocks
+                WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
+                OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
+            )
+            ORDER BY m.id ASC
+        ');
+        $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
+        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
 
-        if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
-            continue;
+        $messages = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+            if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+                continue;
+            }
+
+            $messages[] = [
+                'id' => $row['id'],
+                'from_user_id' => $row['from_user_id'],
+                'to_user_id' => $row['to_user_id'],
+                'message' => $row['message'],
+                'timestamp' => $row['timestamp'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
+                'from_username' => $row['from_username'],
+                'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
+            ];
+
+            $lastMessageId = max($lastMessageId, (int)$row['id']);
         }
 
-        $messages[] = [
-            'id' => $row['id'],
-            'from_user_id' => $row['from_user_id'],
-            'to_user_id' => $row['to_user_id'],
-            'message' => $row['message'],
-            'timestamp' => $row['timestamp'],
-            'attachment_url' => $row['attachment_path'] ?: null,
-            'attachment_type' => $row['attachment_type'] ?: null,
-            'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
-            'from_username' => $row['from_username'],
-            'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
-        ];
+        if (!empty($messages)) {
+            echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
+            flush();
+        }
+
+        if (time() - $lastPingTime >= 15) {
+            echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
+            flush();
+            $lastPingTime = time();
+            touchUserSession($currentUserId);
+        }
+
+        usleep(500000);
     }
-    
-    if (!empty($messages)) {
-        echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
-        flush();
-    } else {
-        echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
-        flush();
-    }
-    
+
     exit;
 }
 
@@ -3660,6 +3720,131 @@ let usePollingFallback = false;
 let pollingTimerId = null;
 let isPollingUpdates = false;
 const POLLING_INTERVAL_MS = 5000;
+const WATCHDOG_INTERVAL_MS = 10000;
+const SSE_RECOVERY_INTERVAL_MS = 15000;
+let connectivityTimerId = null;
+let consecutivePingFailures = 0;
+let lastRecoveryAttemptAt = 0;
+let probeController = null;
+
+function buildSSEUrl() {
+    return buildUrl({ stream: 'events', last_message_id: state.lastMessageId, t: Date.now() });
+}
+
+async function connectivityPing() {
+    const formData = new FormData();
+    formData.append('action', 'ping');
+
+    try {
+        const response = await postFormData(formData);
+        if (!response.ok) {
+            throw new Error(`HTTP_${response.status}`);
+        }
+
+        await response.json().catch(() => ({}));
+
+        consecutivePingFailures = 0;
+
+        if (usePollingFallback) {
+            tryRecoverRealtime();
+        }
+    } catch (error) {
+        consecutivePingFailures += 1;
+        console.warn('Ping fehlgeschlagen:', error);
+
+        if (consecutivePingFailures >= 2) {
+            enablePollingFallback();
+        }
+    }
+}
+
+function startConnectivityWatchdog() {
+    if (connectivityTimerId) {
+        clearInterval(connectivityTimerId);
+    }
+
+    connectivityPing();
+    connectivityTimerId = setInterval(connectivityPing, WATCHDOG_INTERVAL_MS);
+}
+
+async function attemptSSEProbe() {
+    if (probeController) {
+        probeController.abort();
+    }
+
+    probeController = new AbortController();
+
+    return new Promise((resolve) => {
+        let resolved = false;
+        let probe;
+
+        const cleanup = (result) => {
+            if (resolved) {
+                return;
+            }
+
+            resolved = true;
+
+            probeController = null;
+
+            if (probe) {
+                try {
+                    probe.close();
+                } catch (error) {
+                    console.debug('Probe konnte nicht geschlossen werden:', error);
+                }
+            }
+
+            resolve(result);
+        };
+
+        try {
+            probe = new EventSource(buildSSEUrl());
+        } catch (error) {
+            console.debug('SSE-Probe konnte nicht erstellt werden:', error);
+            cleanup(false);
+            return;
+        }
+
+        const timeoutId = setTimeout(() => cleanup(false), 4000);
+
+        probe.onopen = () => {
+            clearTimeout(timeoutId);
+            cleanup(true);
+        };
+
+        probe.onerror = () => {
+            clearTimeout(timeoutId);
+            cleanup(false);
+        };
+
+        probeController.signal.addEventListener('abort', () => {
+            clearTimeout(timeoutId);
+            cleanup(false);
+        }, { once: true });
+    });
+}
+
+async function tryRecoverRealtime() {
+    if (!usePollingFallback) {
+        return;
+    }
+
+    const now = Date.now();
+    if (now - lastRecoveryAttemptAt < SSE_RECOVERY_INTERVAL_MS) {
+        return;
+    }
+
+    lastRecoveryAttemptAt = now;
+
+    const canRecover = await attemptSSEProbe();
+    if (!canRecover) {
+        return;
+    }
+
+    console.info('SSE-Verbindung wieder verfügbar – versuche Wechsel von Polling.');
+    startSSE({ force: true });
+}
 
 function processIncomingMessages(messages) {
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -3762,20 +3947,17 @@ function enablePollingFallback() {
         state.eventSource = null;
     }
 
+    if (probeController) {
+        probeController.abort();
+        probeController = null;
+    }
+
     if (!state.connectionErrorShown && state.selectedUserId && !state.isLoadingMessages) {
         updateChatState('error', 'Live-Verbindung blockiert. Wechsel auf sichere Aktualisierung…');
         state.connectionErrorShown = true;
     }
 
     startPollingUpdates();
-}
-
-function startRealtime() {
-    if (usePollingFallback) {
-        startPollingUpdates();
-    } else {
-        startSSE();
-    }
 }
 
 async function loadUsers() {
@@ -3796,6 +3978,10 @@ async function loadUsers() {
 
         if (result.success) {
             state.users = Array.isArray(result.users) ? result.users : [];
+            if (result.diagnostics) {
+                console.debug('Nutzerliste Diagnose', result.diagnostics);
+            }
+            console.debug('Nutzerliste geladen:', { count: state.users.length });
         } else {
             throw new Error(result.error || 'Nutzerliste konnte nicht geladen werden.');
         }
@@ -4174,6 +4360,9 @@ async function sendMessage() {
             clearAttachmentSelection();
             clearAttachmentWarning();
         } else {
+            if (result.error && /bild/i.test(result.error)) {
+                clearAttachmentSelection();
+            }
             showAttachmentWarning(result.error || 'Nachricht konnte nicht gesendet werden.');
         }
     } catch (error) {
@@ -4191,15 +4380,24 @@ async function markAsRead(userId) {
     loadUsers();
 }
 
-function startSSE() {
-    stopPollingUpdates();
+function startSSE(options = {}) {
+    const force = options.force === true;
+
+    if (usePollingFallback && !force) {
+        startPollingUpdates();
+        return;
+    }
+
+    if (!usePollingFallback || !force) {
+        stopPollingUpdates();
+    }
 
     if (state.eventSource) {
         state.eventSource.close();
         state.eventSource = null;
     }
 
-    const url = buildUrl({ stream: 'events', last_message_id: state.lastMessageId, t: Date.now() });
+    const url = buildSSEUrl();
 
     try {
         state.eventSource = new EventSource(url);
@@ -4210,8 +4408,16 @@ function startSSE() {
     }
 
     state.eventSource.onopen = () => {
+        console.debug('SSE verbunden.');
         sseErrorCount = 0;
         state.connectionErrorShown = false;
+        consecutivePingFailures = 0;
+
+        if (usePollingFallback) {
+            console.info('SSE erfolgreich wiederhergestellt.');
+            usePollingFallback = false;
+            stopPollingUpdates();
+        }
 
         if (!state.selectedUserId) {
             return;
@@ -4353,15 +4559,10 @@ chatInputEl?.addEventListener('input', function() {
     this.style.height = Math.min(this.scrollHeight, 100) + 'px';
 });
 
-setInterval(async () => {
-    const formData = new FormData();
-    formData.append('action', 'ping');
-    await postFormData(formData);
-}, 10000);
-
 loadUsers();
-startRealtime();
+startSSE();
 setInterval(loadUsers, 30000);
+startConnectivityWatchdog();
 
 <?php endif; ?>
 </script>
