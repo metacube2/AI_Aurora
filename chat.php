@@ -3193,6 +3193,14 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             color: #c2410c;
         }
 
+        .user-list-error-banner {
+            margin: 12px 16px;
+            border-radius: 10px;
+            background: rgba(255, 237, 213, 0.85);
+            border: 1px solid rgba(251, 146, 60, 0.35);
+            padding: 12px 14px;
+        }
+
         .chat-state-message.hidden {
             display: none;
         }
@@ -4359,9 +4367,42 @@ async function loadUsers() {
     } catch (error) {
         console.error('Nutzerliste konnte nicht geladen werden:', error);
         state.isLoadingUsers = false;
-        if (userListEl) {
-            userListEl.innerHTML = '<div class="error-state">Nutzerliste konnte nicht geladen werden.</div>';
+
+        const message = (error && error.message) ? error.message : 'Nutzerliste konnte nicht geladen werden.';
+        if (/nicht\s+eingeloggt/i.test(message) || /sitzung/i.test(message)) {
+            window.location.href = basePath;
+            return;
         }
+
+        if (userListEl) {
+            if (!Array.isArray(state.users) || state.users.length === 0) {
+                userListEl.innerHTML = '';
+                const errorBox = document.createElement('div');
+                errorBox.className = 'error-state user-list-error-banner';
+                errorBox.textContent = message;
+                userListEl.appendChild(errorBox);
+            } else {
+                const existingBanner = userListEl.querySelector('.user-list-error-banner');
+                if (existingBanner) {
+                    existingBanner.remove();
+                }
+                const banner = document.createElement('div');
+                banner.className = 'error-state user-list-error-banner';
+                banner.textContent = message;
+                userListEl.prepend(banner);
+                setTimeout(() => {
+                    if (banner.parentNode) {
+                        banner.remove();
+                    }
+                }, 5000);
+            }
+        }
+
+        setTimeout(() => {
+            if (!state.isLoadingUsers) {
+                loadUsers();
+            }
+        }, 5000);
     }
 }
 
@@ -4390,27 +4431,29 @@ function renderUserList() {
         return;
     }
 
-    const offlineLimit = 5;
-    const onlineUsers = [];
-    const offlineUsers = [];
+    const prioritizedUsers = filtered.slice();
 
-    filtered.forEach(user => {
-        if (user.is_online) {
-            onlineUsers.push(user);
-        } else {
-            offlineUsers.push(user);
+    if (state.selectedUserId && !prioritizedUsers.some(user => Number(user.id) === Number(state.selectedUserId))) {
+        const selectedUser = users.find(user => Number(user.id) === Number(state.selectedUserId));
+        if (selectedUser && selectedUser.display_name.toLowerCase().includes(searchTerm)) {
+            prioritizedUsers.push(selectedUser);
         }
-    });
+    }
 
-    const limitedUsers = onlineUsers.concat(offlineUsers.slice(0, offlineLimit));
-
+    const seen = new Set();
     const fragment = document.createDocumentFragment();
 
-    limitedUsers.forEach(user => {
+    prioritizedUsers.forEach(user => {
+        const userId = Number(user.id);
+        if (seen.has(userId)) {
+            return;
+        }
+        seen.add(userId);
+
         const item = document.createElement('button');
         item.type = 'button';
-        item.className = 'user-item' + (Number(user.id) === Number(state.selectedUserId) ? ' active' : '');
-        item.dataset.userId = String(user.id);
+        item.className = 'user-item' + (userId === Number(state.selectedUserId) ? ' active' : '');
+        item.dataset.userId = String(userId);
         item.dataset.displayName = user.display_name;
 
         const avatar = document.createElement('div');
@@ -4918,8 +4961,21 @@ userSearchInput?.addEventListener('input', () => renderUserList());
 document.getElementById('logoutBtn')?.addEventListener('click', async () => {
     const formData = new FormData();
     formData.append('action', 'logout');
-    await postFormData(formData);
-    window.location.reload();
+
+    try {
+        const response = await postFormData(formData);
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            const result = await response.json().catch(() => null);
+            if (result && result.success === false) {
+                throw new Error(result.error || 'Logout fehlgeschlagen.');
+            }
+        }
+    } catch (error) {
+        console.error('Logout fehlgeschlagen:', error);
+    } finally {
+        window.location.href = basePath;
+    }
 });
 
 chatInputEl?.addEventListener('input', function() {
