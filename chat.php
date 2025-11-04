@@ -217,6 +217,17 @@ function getDB() {
             )
         ');
 
+        // Settings Table (Feature-Flags)
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ');
+
+        initializeDefaultSettings($db);
+
         // Create default admin if not exists
         $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
         $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
@@ -275,6 +286,115 @@ function resolveStoredAgeGroup($storedAgeGroup, $birthdate) {
     }
 
     return 'O18';
+}
+
+function initializeDefaultSettings(SQLite3 $db) {
+    static $defaultsInitialized = false;
+
+    if ($defaultsInitialized) {
+        return;
+    }
+
+    $defaultsInitialized = true;
+
+    $defaults = [
+        'age_filter_enabled' => '0',
+        'keyword_filter_enabled' => '0',
+        'profanity_filter_enabled' => '0',
+        'link_filter_enabled' => '0',
+    ];
+
+    $stmt = $db->prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (:key, :value)');
+
+    foreach ($defaults as $key => $value) {
+        $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+        $stmt->bindValue(':value', $value, SQLITE3_TEXT);
+        $stmt->execute();
+    }
+}
+
+function settingsCache($forceReload = false) {
+    static $cache = null;
+
+    if ($forceReload) {
+        $cache = null;
+    }
+
+    if ($cache === null) {
+        $cache = [];
+        $db = getDB();
+        $result = $db->query('SELECT key, value FROM settings');
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $cache[$row['key']] = $row['value'];
+        }
+    }
+
+    return $cache;
+}
+
+function getSetting($key, $default = null) {
+    $cache = settingsCache();
+    return array_key_exists($key, $cache) ? $cache[$key] : $default;
+}
+
+function setSettingValue($key, $value) {
+    $db = getDB();
+    $stmt = $db->prepare('
+        INSERT OR REPLACE INTO settings (key, value, updated_at)
+        VALUES (:key, :value, CURRENT_TIMESTAMP)
+    ');
+    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    $stmt->bindValue(':value', $value, SQLITE3_TEXT);
+    $stmt->execute();
+
+    settingsCache(true);
+}
+
+function normalizeBooleanFlag($value) {
+    if (is_bool($value)) {
+        return $value;
+    }
+
+    if (is_int($value)) {
+        return $value === 1;
+    }
+
+    $stringValue = is_string($value) ? strtolower(trim($value)) : '';
+    if ($stringValue === '') {
+        return false;
+    }
+
+    return in_array($stringValue, ['1', 'true', 'yes', 'on'], true);
+}
+
+function isFeatureEnabled($settingKey, $default = false) {
+    $defaultValue = $default ? '1' : '0';
+    return normalizeBooleanFlag(getSetting($settingKey, $defaultValue));
+}
+
+function isAgeFilterEnabled() {
+    return isFeatureEnabled('age_filter_enabled', false);
+}
+
+function isKeywordFilterEnabled() {
+    return isFeatureEnabled('keyword_filter_enabled', false);
+}
+
+function isProfanityFilterEnabled() {
+    return isFeatureEnabled('profanity_filter_enabled', false);
+}
+
+function isLinkFilterEnabled() {
+    return isFeatureEnabled('link_filter_enabled', false);
+}
+
+function getFeatureSettings() {
+    return [
+        'age_filter_enabled' => isAgeFilterEnabled(),
+        'keyword_filter_enabled' => isKeywordFilterEnabled(),
+        'profanity_filter_enabled' => isProfanityFilterEnabled(),
+        'link_filter_enabled' => isLinkFilterEnabled(),
+    ];
 }
 
 function checkKeywordBlacklist($message) {
@@ -400,6 +520,10 @@ function logSecurityEvent($userId, $action, $details = '') {
 }
 
 function canUsersChatByAge($ageGroupA, $ageGroupB) {
+    if (!isAgeFilterEnabled()) {
+        return true;
+    }
+
     if (!$ageGroupA || !$ageGroupB) {
         return false;
     }
@@ -895,6 +1019,8 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
         
+        $ageFilterEnabled = isAgeFilterEnabled();
+
         $query = '
             SELECT
                 u.id,
@@ -934,10 +1060,12 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             AND u.is_banned = 0
         ';
 
-        if ($currentAgeGroup === 'U18') {
-            $query .= ' AND (u.age_group = :allowed_group)';
-        } else {
-            $query .= ' AND (u.age_group != :blocked_group OR u.age_group IS NULL)';
+        if ($ageFilterEnabled) {
+            if ($currentAgeGroup === 'U18') {
+                $query .= ' AND (u.age_group = :allowed_group)';
+            } else {
+                $query .= ' AND (u.age_group != :blocked_group OR u.age_group IS NULL)';
+            }
         }
 
         $query .= ' ORDER BY is_online DESC, u.username ASC';
@@ -945,10 +1073,12 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $stmt = $db->prepare($query);
         $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
 
-        if ($currentAgeGroup === 'U18') {
-            $stmt->bindValue(':allowed_group', 'U18', SQLITE3_TEXT);
-        } else {
-            $stmt->bindValue(':blocked_group', 'U18', SQLITE3_TEXT);
+        if ($ageFilterEnabled) {
+            if ($currentAgeGroup === 'U18') {
+                $stmt->bindValue(':allowed_group', 'U18', SQLITE3_TEXT);
+            } else {
+                $stmt->bindValue(':blocked_group', 'U18', SQLITE3_TEXT);
+            }
         }
         $result = $stmt->execute();
         
@@ -984,9 +1114,10 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
                 $currentUserId,
                 'GET_USERS_FILTERED_EMPTY',
                 sprintf(
-                    'Raw: %d | AgeGroup: %s',
+                    'Raw: %d | AgeGroup: %s | AgeFilter: %s',
                     $rawCount,
-                    $currentAgeGroup
+                    $currentAgeGroup,
+                    $ageFilterEnabled ? 'on' : 'off'
                 )
             );
         }
@@ -997,7 +1128,8 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             'diagnostics' => [
                 'raw_count' => $rawCount,
                 'filtered_count' => count($users),
-                'current_age_group' => $currentAgeGroup
+                'current_age_group' => $currentAgeGroup,
+                'feature_flags' => getFeatureSettings()
             ]
         ]);
         exit;
@@ -1205,40 +1337,46 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         }
 
         if ($message !== '') {
-            // Keyword Blacklist
-            $keywordCheck = checkKeywordBlacklist($message);
-            if ($keywordCheck['blocked']) {
-                logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
-                echo json_encode([
-                    'success' => false,
-                    'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
-                    'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
-                ]);
-                exit;
+            if (isKeywordFilterEnabled()) {
+                // Keyword Blacklist
+                $keywordCheck = checkKeywordBlacklist($message);
+                if ($keywordCheck['blocked']) {
+                    logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
+                    echo json_encode([
+                        'success' => false,
+                        'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
+                        'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
+                    ]);
+                    exit;
+                }
             }
 
-            // Profanity Filter
-            $profanityCheck = checkProfanityFilter($message);
-            if ($profanityCheck['blocked']) {
-                logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
-                echo json_encode([
-                    'success' => false,
-                    'error' => 'Deine Nachricht enthält Schimpfwörter',
-                    'details' => 'Bitte verwende eine angemessene Sprache'
-                ]);
-                exit;
+            if (isProfanityFilterEnabled()) {
+                // Profanity Filter
+                $profanityCheck = checkProfanityFilter($message);
+                if ($profanityCheck['blocked']) {
+                    logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
+                    echo json_encode([
+                        'success' => false,
+                        'error' => 'Deine Nachricht enthält Schimpfwörter',
+                        'details' => 'Bitte verwende eine angemessene Sprache'
+                    ]);
+                    exit;
+                }
             }
 
-            // Link Filter
-            $linkCheck = checkLinkFilter($message);
-            if ($linkCheck['blocked']) {
-                logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
-                echo json_encode([
-                    'success' => false,
-                    'error' => 'Links sind nicht erlaubt',
-                    'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
-                ]);
-                exit;
+            if (isLinkFilterEnabled()) {
+                // Link Filter
+                $linkCheck = checkLinkFilter($message);
+                if ($linkCheck['blocked']) {
+                    logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
+                    echo json_encode([
+                        'success' => false,
+                        'error' => 'Links sind nicht erlaubt',
+                        'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
+                    ]);
+                    exit;
+                }
             }
         }
 
@@ -1638,15 +1776,47 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         echo json_encode([
             'success' => true,
             'stats' => [
-                'total_users' => $totalUsers,
-                'u18_users' => $u18Users,
-                'o18_users' => $o18Users,
-                'online_users' => $onlineUsers,
-                'total_messages' => $totalMessages,
-                'flagged_messages' => $flaggedMessages,
-                'pending_reports' => $pendingReports,
-                'banned_users' => $bannedUsers
+                'total_users' => (int)$totalUsers,
+                'u18_users' => (int)$u18Users,
+                'o18_users' => (int)$o18Users,
+                'online_users' => (int)$onlineUsers,
+                'total_messages' => (int)$totalMessages,
+                'flagged_messages' => (int)$flaggedMessages,
+                'pending_reports' => (int)$pendingReports,
+                'banned_users' => (int)$bannedUsers
             ]
+        ]);
+        exit;
+    }
+
+    if ($action === 'admin_get_settings') {
+        echo json_encode([
+            'success' => true,
+            'settings' => getFeatureSettings()
+        ]);
+        exit;
+    }
+
+    if ($action === 'admin_update_settings') {
+        $allowedKeys = [
+            'age_filter_enabled',
+            'keyword_filter_enabled',
+            'profanity_filter_enabled',
+            'link_filter_enabled'
+        ];
+
+        $updatedValues = [];
+        foreach ($allowedKeys as $key) {
+            $value = normalizeBooleanFlag($_POST[$key] ?? '0') ? '1' : '0';
+            setSettingValue($key, $value);
+            $updatedValues[$key] = $value;
+        }
+
+        logSecurityEvent(null, 'ADMIN_UPDATE_SETTINGS', json_encode($updatedValues));
+
+        echo json_encode([
+            'success' => true,
+            'settings' => getFeatureSettings()
         ]);
         exit;
     }
@@ -2336,6 +2506,48 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             color: var(--sun-700);
         }
 
+        .admin-settings-form {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin-top: 10px;
+        }
+
+        .admin-settings-toggle {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .admin-settings-toggle input {
+            margin-top: 4px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .admin-settings-toggle strong {
+            display: block;
+            font-size: 15px;
+            color: var(--sun-800);
+        }
+
+        .admin-settings-description {
+            font-size: 13px;
+            color: rgba(120, 53, 15, 0.75);
+            margin-top: 2px;
+        }
+
+        .admin-settings-status {
+            margin-top: 12px;
+            font-size: 13px;
+            color: #2563eb;
+        }
+
+        .admin-settings-status.error {
+            color: #dc2626;
+        }
+
         .admin-table-wrapper {
             overflow-x: auto;
         }
@@ -2981,6 +3193,14 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             color: #c2410c;
         }
 
+        .user-list-error-banner {
+            margin: 12px 16px;
+            border-radius: 10px;
+            background: rgba(255, 237, 213, 0.85);
+            border: 1px solid rgba(251, 146, 60, 0.35);
+            padding: 12px 14px;
+        }
+
         .chat-state-message.hidden {
             display: none;
         }
@@ -3012,6 +3232,51 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         </div>
 
         <div class="admin-sections">
+            <div class="admin-section">
+                <div class="admin-section-header">
+                    <h2>⚙️ Sicherheitsfilter</h2>
+                </div>
+                <form id="adminSettingsForm" class="admin-settings-form">
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="age_filter_enabled">
+                        <div>
+                            <strong>Altersfilter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Wenn aktiviert, können nur Nutzer derselben Altersgruppe miteinander chatten.
+                            </div>
+                        </div>
+                    </label>
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="keyword_filter_enabled">
+                        <div>
+                            <strong>Keyword-Filter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Blockiert Nachrichten mit sensiblen Schlüsselwörtern (Adressen, Treffen usw.).
+                            </div>
+                        </div>
+                    </label>
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="profanity_filter_enabled">
+                        <div>
+                            <strong>Schimpfwort-Filter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Verhindert das Versenden von beleidigenden Ausdrücken.
+                            </div>
+                        </div>
+                    </label>
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="link_filter_enabled">
+                        <div>
+                            <strong>Link-Filter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Unterbindet das Versenden von URLs und externen Links.
+                            </div>
+                        </div>
+                    </label>
+                </form>
+                <div class="admin-settings-status" id="adminSettingsStatus"></div>
+            </div>
+
             <div class="admin-section">
                 <div class="admin-section-header">
                     <h2>🚨 Offene Meldungen</h2>
@@ -3233,6 +3498,9 @@ const adminStatsGrid = document.getElementById('adminStatsGrid');
 const adminReportsContainer = document.getElementById('adminReportsContainer');
 const adminFlaggedContainer = document.getElementById('adminFlaggedContainer');
 const adminBannedContainer = document.getElementById('adminBannedContainer');
+const adminSettingsForm = document.getElementById('adminSettingsForm');
+const adminSettingsStatus = document.getElementById('adminSettingsStatus');
+let adminSettingsMessageTimer = null;
 
 function adminEscapeHtml(text) {
     const div = document.createElement('div');
@@ -3257,6 +3525,113 @@ async function adminFetch(action, payload = {}) {
     const response = await postFormData(formData);
     return response.json();
 }
+
+function parseAdminBoolean(value) {
+    if (value === true || value === false) {
+        return value;
+    }
+
+    if (typeof value === 'number') {
+        return value === 1;
+    }
+
+    if (typeof value === 'string') {
+        return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+    }
+
+    return false;
+}
+
+function setAdminSettingsStatus(message, isError = false) {
+    if (!adminSettingsStatus) {
+        return;
+    }
+
+    if (adminSettingsMessageTimer) {
+        clearTimeout(adminSettingsMessageTimer);
+        adminSettingsMessageTimer = null;
+    }
+
+    adminSettingsStatus.textContent = message || '';
+    adminSettingsStatus.classList.toggle('error', Boolean(isError && message));
+
+    if (message && !isError) {
+        adminSettingsMessageTimer = setTimeout(() => {
+            if (adminSettingsStatus.textContent === message) {
+                adminSettingsStatus.textContent = '';
+            }
+        }, 2500);
+    }
+}
+
+function applyAdminSettings(settings) {
+    if (!adminSettingsForm || !settings) {
+        return;
+    }
+
+    const keys = ['age_filter_enabled', 'keyword_filter_enabled', 'profanity_filter_enabled', 'link_filter_enabled'];
+    keys.forEach((key) => {
+        const input = adminSettingsForm.elements.namedItem(key);
+        if (input) {
+            input.checked = parseAdminBoolean(settings[key]);
+        }
+    });
+}
+
+async function loadAdminSettings() {
+    if (!adminSettingsForm) {
+        return;
+    }
+
+    try {
+        const response = await fetch(buildUrl({ action: 'admin_get_settings' }), { credentials: 'same-origin' });
+        if (!response.ok) {
+            throw new Error('Einstellungen konnten nicht geladen werden.');
+        }
+
+        const result = await response.json();
+        if (!result.success) {
+            throw new Error(result.error || 'Einstellungen konnten nicht geladen werden.');
+        }
+
+        applyAdminSettings(result.settings || {});
+        setAdminSettingsStatus('');
+    } catch (error) {
+        setAdminSettingsStatus(error.message || 'Einstellungen konnten nicht geladen werden.', true);
+    }
+}
+
+async function saveAdminSettings() {
+    if (!adminSettingsForm) {
+        return;
+    }
+
+    const payload = {};
+    const keys = ['age_filter_enabled', 'keyword_filter_enabled', 'profanity_filter_enabled', 'link_filter_enabled'];
+    keys.forEach((key) => {
+        const input = adminSettingsForm.elements.namedItem(key);
+        if (input) {
+            payload[key] = input.checked ? '1' : '0';
+        }
+    });
+
+    try {
+        setAdminSettingsStatus('Speichere…');
+        const result = await adminFetch('admin_update_settings', payload);
+        if (!result.success) {
+            throw new Error(result.error || 'Speichern fehlgeschlagen.');
+        }
+
+        applyAdminSettings(result.settings || {});
+        setAdminSettingsStatus('Einstellungen gespeichert.');
+    } catch (error) {
+        setAdminSettingsStatus(error.message || 'Speichern fehlgeschlagen.', true);
+    }
+}
+
+adminSettingsForm?.addEventListener('change', () => {
+    saveAdminSettings();
+});
 
 function renderAdminStats(stats) {
     if (!stats) {
@@ -3495,7 +3870,8 @@ async function refreshAdminData() {
         loadAdminStats(),
         loadAdminReports(),
         loadAdminFlagged(),
-        loadAdminBanned()
+        loadAdminBanned(),
+        loadAdminSettings()
     ]);
 }
 
@@ -3991,9 +4367,42 @@ async function loadUsers() {
     } catch (error) {
         console.error('Nutzerliste konnte nicht geladen werden:', error);
         state.isLoadingUsers = false;
-        if (userListEl) {
-            userListEl.innerHTML = '<div class="error-state">Nutzerliste konnte nicht geladen werden.</div>';
+
+        const message = (error && error.message) ? error.message : 'Nutzerliste konnte nicht geladen werden.';
+        if (/nicht\s+eingeloggt/i.test(message) || /sitzung/i.test(message)) {
+            window.location.href = basePath;
+            return;
         }
+
+        if (userListEl) {
+            if (!Array.isArray(state.users) || state.users.length === 0) {
+                userListEl.innerHTML = '';
+                const errorBox = document.createElement('div');
+                errorBox.className = 'error-state user-list-error-banner';
+                errorBox.textContent = message;
+                userListEl.appendChild(errorBox);
+            } else {
+                const existingBanner = userListEl.querySelector('.user-list-error-banner');
+                if (existingBanner) {
+                    existingBanner.remove();
+                }
+                const banner = document.createElement('div');
+                banner.className = 'error-state user-list-error-banner';
+                banner.textContent = message;
+                userListEl.prepend(banner);
+                setTimeout(() => {
+                    if (banner.parentNode) {
+                        banner.remove();
+                    }
+                }, 5000);
+            }
+        }
+
+        setTimeout(() => {
+            if (!state.isLoadingUsers) {
+                loadUsers();
+            }
+        }, 5000);
     }
 }
 
@@ -4022,27 +4431,29 @@ function renderUserList() {
         return;
     }
 
-    const offlineLimit = 5;
-    const onlineUsers = [];
-    const offlineUsers = [];
+    const prioritizedUsers = filtered.slice();
 
-    filtered.forEach(user => {
-        if (user.is_online) {
-            onlineUsers.push(user);
-        } else {
-            offlineUsers.push(user);
+    if (state.selectedUserId && !prioritizedUsers.some(user => Number(user.id) === Number(state.selectedUserId))) {
+        const selectedUser = users.find(user => Number(user.id) === Number(state.selectedUserId));
+        if (selectedUser && selectedUser.display_name.toLowerCase().includes(searchTerm)) {
+            prioritizedUsers.push(selectedUser);
         }
-    });
+    }
 
-    const limitedUsers = onlineUsers.concat(offlineUsers.slice(0, offlineLimit));
-
+    const seen = new Set();
     const fragment = document.createDocumentFragment();
 
-    limitedUsers.forEach(user => {
+    prioritizedUsers.forEach(user => {
+        const userId = Number(user.id);
+        if (seen.has(userId)) {
+            return;
+        }
+        seen.add(userId);
+
         const item = document.createElement('button');
         item.type = 'button';
-        item.className = 'user-item' + (Number(user.id) === Number(state.selectedUserId) ? ' active' : '');
-        item.dataset.userId = String(user.id);
+        item.className = 'user-item' + (userId === Number(state.selectedUserId) ? ' active' : '');
+        item.dataset.userId = String(userId);
         item.dataset.displayName = user.display_name;
 
         const avatar = document.createElement('div');
@@ -4550,8 +4961,21 @@ userSearchInput?.addEventListener('input', () => renderUserList());
 document.getElementById('logoutBtn')?.addEventListener('click', async () => {
     const formData = new FormData();
     formData.append('action', 'logout');
-    await postFormData(formData);
-    window.location.reload();
+
+    try {
+        const response = await postFormData(formData);
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            const result = await response.json().catch(() => null);
+            if (result && result.success === false) {
+                throw new Error(result.error || 'Logout fehlgeschlagen.');
+            }
+        }
+    } catch (error) {
+        console.error('Logout fehlgeschlagen:', error);
+    } finally {
+        window.location.href = basePath;
+    }
 });
 
 chatInputEl?.addEventListener('input', function() {
@@ -4561,6 +4985,16 @@ chatInputEl?.addEventListener('input', function() {
 
 loadUsers();
 startSSE();
+attemptSSEProbe()
+    .then((canUse) => {
+        if (!canUse) {
+            console.info('SSE nicht verfügbar – wechsle auf Polling-Fallback.');
+            enablePollingFallback();
+        }
+    })
+    .catch(() => {
+        enablePollingFallback();
+    });
 setInterval(loadUsers, 30000);
 startConnectivityWatchdog();
 
