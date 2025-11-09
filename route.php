@@ -126,36 +126,15 @@ $positions = generatePositions($traceData);
             display: flex;
             flex: 1;
             overflow: hidden;
-            min-height: 0;
         }
         #canvas-container {
             flex: 1;
             position: relative;
-            min-height: 420px;
-            background: radial-gradient(circle at 20% 20%, rgba(59, 130, 246, 0.15), transparent 55%),
-                        radial-gradient(circle at 80% 30%, rgba(45, 212, 191, 0.12), transparent 45%),
-                        #020617;
         }
         #scene {
-            position: absolute;
-            top: 0;
-            left: 0;
             width: 100%;
             height: 100%;
             display: block;
-        }
-        #canvas-overlay {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 2rem;
-            text-align: center;
-            background: rgba(15, 23, 42, 0.75);
-            backdrop-filter: blur(4px);
-            font-size: 1.1rem;
-            line-height: 1.6;
         }
         #panel {
             width: 320px;
@@ -264,12 +243,6 @@ $positions = generatePositions($traceData);
 <main>
     <div id="canvas-container">
         <canvas id="scene"></canvas>
-        <div id="canvas-overlay" hidden>
-            <div>
-                <strong>WebGL nicht verfügbar</strong>
-                <p>Der 3D-Traceroute benötigt WebGL-Unterstützung. Bitte verwenden Sie einen aktuellen Browser oder aktivieren Sie WebGL in den Einstellungen.</p>
-            </div>
-        </div>
     </div>
     <aside id="panel">
         <form method="get">
@@ -330,42 +303,23 @@ $positions = generatePositions($traceData);
 <script>
 (function() {
     const canvas = document.getElementById('scene');
-    const container = document.getElementById('canvas-container');
-    const overlay = document.getElementById('canvas-overlay');
-
-    let renderer;
-    try {
-        renderer = new THREE.WebGLRenderer({canvas, antialias: true, alpha: true});
-    } catch (error) {
-        overlay.hidden = false;
-        console.error('WebGLRenderer konnte nicht initialisiert werden', error);
-        return;
-    }
-
+    const renderer = new THREE.WebGLRenderer({canvas, antialias: true});
     renderer.setPixelRatio(window.devicePixelRatio);
-
-    function setRendererSize() {
-        const width = container.clientWidth || window.innerWidth;
-        const height = container.clientHeight || window.innerHeight;
-        renderer.setSize(width, height, false);
-        camera.aspect = width / height;
-        camera.updateProjectionMatrix();
-    }
+    renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x020617);
 
-    const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+    const camera = new THREE.PerspectiveCamera(60, canvas.clientWidth / canvas.clientHeight, 0.1, 1000);
     camera.position.set(60, 60, 60);
 
     const controls = new THREE.OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
 
-    const light = new THREE.PointLight(0xffffff, 1.1, 500, 2);
-    light.position.set(50, 120, 60);
+    const light = new THREE.PointLight(0xffffff, 1.2);
+    light.position.set(50, 50, 50);
     scene.add(light);
-    scene.add(new THREE.AmbientLight(0x93c5fd, 0.35));
-    scene.add(new THREE.HemisphereLight(0x38bdf8, 0x0f172a, 0.4));
+    scene.add(new THREE.AmbientLight(0x4c566a, 0.6));
 
     const nodeMaterial = new THREE.MeshStandardMaterial({color: 0x38bdf8, emissive: 0x0f172a});
     const targetMaterial = new THREE.MeshStandardMaterial({color: 0x22d3ee, emissive: 0x164e63});
@@ -402,7 +356,7 @@ $positions = generatePositions($traceData);
         particlePositions[i * 3 + 2] = (Math.random() - 0.5) * 400;
     }
     particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
-    const particleMaterial = new THREE.PointsMaterial({color: 0x0f172a, size: 1.1});
+    const particleMaterial = new THREE.PointsMaterial({color: 0x1e293b, size: 1.2});
     const particles = new THREE.Points(particleGeometry, particleMaterial);
     scene.add(particles);
 
@@ -410,19 +364,25 @@ $positions = generatePositions($traceData);
     const pointer = new THREE.Vector2();
     const hopList = document.getElementById('hop-list');
 
+    function resizeRendererToDisplaySize() {
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        const needResize = canvas.width !== width || canvas.height !== height;
+        if (needResize) {
+            renderer.setSize(width, height, false);
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+        }
+        return needResize;
+    }
+
     function animate() {
         requestAnimationFrame(animate);
         controls.update();
-        setRendererSize();
-        nodes.forEach((node, index) => {
-            const pulse = Math.sin(Date.now() * 0.001 + index) * 0.15 + 1.05;
-            node.scale.setScalar(pulse);
-        });
-        particles.rotation.y += 0.0007;
+        resizeRendererToDisplaySize();
         renderer.render(scene, camera);
     }
 
-    setRendererSize();
     animate();
 
     const infoCards = Array.from(document.querySelectorAll('.hop-card'));
@@ -441,7 +401,7 @@ $positions = generatePositions($traceData);
         setActiveHop(index);
     }
 
-    window.addEventListener('resize', () => setRendererSize());
+    window.addEventListener('resize', () => resizeRendererToDisplaySize());
 
     renderer.domElement.addEventListener('click', event => {
         const rect = renderer.domElement.getBoundingClientRect();
@@ -503,10 +463,6 @@ $positions = generatePositions($traceData);
             searchNodes();
         }
     });
-
-    if (traceData.length > 0) {
-        focusOnNode(0);
-    }
 })();
 </script>
 </body>

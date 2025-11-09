@@ -30,6 +30,8 @@ define('LOG_RETENTION_MONTHS', 6);
 define('ONLINE_TIMEOUT_SECONDS', 30);
 define('SSE_RETRY_MS', 500);
 define('MAX_MESSAGES_PER_FETCH', 200);
+define('MAX_ATTACHMENT_SIZE', 200 * 1024); // 200 KB
+define('UPLOAD_DIR', __DIR__ . '/uploads');
 
 // Rate Limiting
 define('MAX_MESSAGES_PER_MINUTE', 10);
@@ -71,141 +73,184 @@ $PROFANITY_FILTER = [
 // ═══════════════════════════════════════════════════════════
 
 function getDB() {
-    $db = new SQLite3(DB_FILE);
-    $db->busyTimeout(5000);
-    
-    // Users Table (mit Geburtsdatum und User-ID)
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            user_id TEXT UNIQUE NOT NULL,
-            birthdate DATE NOT NULL,
-            age_group TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_banned INTEGER DEFAULT 0,
-            ban_reason TEXT
-        )
-    ');
-    
-    // Messages Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_user_id INTEGER NOT NULL,
-            to_user_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_read INTEGER DEFAULT 0,
-            is_flagged INTEGER DEFAULT 0,
-            flag_reason TEXT,
-            FOREIGN KEY (from_user_id) REFERENCES users(id),
-            FOREIGN KEY (to_user_id) REFERENCES users(id)
-        )
-    ');
-    
-    // Online Status Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS online_status (
-            user_id INTEGER PRIMARY KEY,
-            last_ping DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ');
+    static $db = null;
+    static $initialized = false;
 
-    // User Sessions Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS user_sessions (
-            user_id INTEGER PRIMARY KEY,
-            session_token TEXT NOT NULL,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ');
+    if ($db === null) {
+        if (!is_dir(UPLOAD_DIR)) {
+            @mkdir(UPLOAD_DIR, 0755, true);
+        }
 
-    // Reports Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reporter_id INTEGER NOT NULL,
-            reported_user_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            message_id INTEGER,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT "pending",
-            FOREIGN KEY (reporter_id) REFERENCES users(id),
-            FOREIGN KEY (reported_user_id) REFERENCES users(id),
-            FOREIGN KEY (message_id) REFERENCES messages(id)
-        )
-    ');
-    
-    // Blocks Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS blocks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            blocker_id INTEGER NOT NULL,
-            blocked_id INTEGER NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (blocker_id) REFERENCES users(id),
-            FOREIGN KEY (blocked_id) REFERENCES users(id),
-            UNIQUE(blocker_id, blocked_id)
-        )
-    ');
-    
-    // Rate Limiting Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            user_id INTEGER NOT NULL,
-            action_type TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ');
-    
-    // Logs Table (für Behörden)
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS security_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT NOT NULL,
-            details TEXT,
-            ip_address TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ');
-    
-    // Admin Table
-    $db->exec('
-        CREATE TABLE IF NOT EXISTS admins (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ');
-    
-    // Create default admin if not exists
-    $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
-    $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-    $result = $stmt->execute();
-    $row = $result->fetchArray(SQLITE3_ASSOC);
-    
-    if ($row['count'] == 0) {
-        $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
-        $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
-        $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
-        $stmt->execute();
+        $db = new SQLite3(DB_FILE);
+        $db->busyTimeout(5000);
     }
-    
-    // Create indexes
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user_id, to_user_id)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen)');
+
+    if (!$initialized) {
+        // Users Table (mit Geburtsdatum und User-ID)
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                user_id TEXT UNIQUE NOT NULL,
+                birthdate DATE NOT NULL,
+                age_group TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_banned INTEGER DEFAULT 0,
+                ban_reason TEXT
+            )
+        ');
+
+        // Messages Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_user_id INTEGER NOT NULL,
+                to_user_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_read INTEGER DEFAULT 0,
+                is_flagged INTEGER DEFAULT 0,
+                flag_reason TEXT,
+                attachment_path TEXT,
+                attachment_type TEXT,
+                attachment_size INTEGER,
+                FOREIGN KEY (from_user_id) REFERENCES users(id),
+                FOREIGN KEY (to_user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Ensure attachment columns exist for older installations
+        $messagesInfo = $db->query('PRAGMA table_info(messages)');
+        $messageColumns = [];
+        while ($column = $messagesInfo->fetchArray(SQLITE3_ASSOC)) {
+            $messageColumns[$column['name']] = true;
+        }
+        if (!isset($messageColumns['attachment_path'])) {
+            $db->exec('ALTER TABLE messages ADD COLUMN attachment_path TEXT');
+        }
+        if (!isset($messageColumns['attachment_type'])) {
+            $db->exec('ALTER TABLE messages ADD COLUMN attachment_type TEXT');
+        }
+        if (!isset($messageColumns['attachment_size'])) {
+            $db->exec('ALTER TABLE messages ADD COLUMN attachment_size INTEGER');
+        }
+
+        // Online Status Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS online_status (
+                user_id INTEGER PRIMARY KEY,
+                last_ping DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // User Sessions Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                user_id INTEGER PRIMARY KEY,
+                session_token TEXT NOT NULL,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Reports Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id INTEGER NOT NULL,
+                reported_user_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                message_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT "pending",
+                FOREIGN KEY (reporter_id) REFERENCES users(id),
+                FOREIGN KEY (reported_user_id) REFERENCES users(id),
+                FOREIGN KEY (message_id) REFERENCES messages(id)
+            )
+        ');
+
+        // Blocks Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                blocker_id INTEGER NOT NULL,
+                blocked_id INTEGER NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (blocker_id) REFERENCES users(id),
+                FOREIGN KEY (blocked_id) REFERENCES users(id),
+                UNIQUE(blocker_id, blocked_id)
+            )
+        ');
+
+        // Rate Limiting Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Logs Table (für Behörden)
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS security_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                details TEXT,
+                ip_address TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ');
+
+        // Admin Table
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ');
+
+        // Settings Table (Feature-Flags)
+        $db->exec('
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ');
+
+        initializeDefaultSettings($db);
+
+        // Create default admin if not exists
+        $stmt = $db->prepare('SELECT COUNT(*) as count FROM admins WHERE username = :username');
+        $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $row = $result->fetchArray(SQLITE3_ASSOC);
+
+        if ($row['count'] == 0) {
+            $stmt = $db->prepare('INSERT INTO admins (username, password_hash) VALUES (:username, :password)');
+            $stmt->bindValue(':username', ADMIN_USERNAME, SQLITE3_TEXT);
+            $stmt->bindValue(':password', ADMIN_PASSWORD, SQLITE3_TEXT);
+            $stmt->execute();
+        }
+
+        // Create indexes
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user_id, to_user_id)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_users_age_group ON users(age_group)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_blocks ON blocks(blocker_id, blocked_id)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_user_sessions_last_seen ON user_sessions(last_seen)');
+
+        $initialized = true;
+    }
 
     return $db;
 }
@@ -227,6 +272,129 @@ function calculateAge($birthdate) {
 function getAgeGroup($birthdate) {
     $age = calculateAge($birthdate);
     return $age < 18 ? 'U18' : 'O18';
+}
+
+function resolveStoredAgeGroup($storedAgeGroup, $birthdate) {
+    $storedAgeGroup = is_string($storedAgeGroup) ? strtoupper(trim($storedAgeGroup)) : '';
+
+    if ($storedAgeGroup === 'U18' || $storedAgeGroup === 'O18') {
+        return $storedAgeGroup;
+    }
+
+    if (!empty($birthdate)) {
+        return getAgeGroup($birthdate);
+    }
+
+    return 'O18';
+}
+
+function initializeDefaultSettings(SQLite3 $db) {
+    static $defaultsInitialized = false;
+
+    if ($defaultsInitialized) {
+        return;
+    }
+
+    $defaultsInitialized = true;
+
+    $defaults = [
+        'age_filter_enabled' => '0',
+        'keyword_filter_enabled' => '0',
+        'profanity_filter_enabled' => '0',
+        'link_filter_enabled' => '0',
+    ];
+
+    $stmt = $db->prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (:key, :value)');
+
+    foreach ($defaults as $key => $value) {
+        $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+        $stmt->bindValue(':value', $value, SQLITE3_TEXT);
+        $stmt->execute();
+    }
+}
+
+function settingsCache($forceReload = false) {
+    static $cache = null;
+
+    if ($forceReload) {
+        $cache = null;
+    }
+
+    if ($cache === null) {
+        $cache = [];
+        $db = getDB();
+        $result = $db->query('SELECT key, value FROM settings');
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $cache[$row['key']] = $row['value'];
+        }
+    }
+
+    return $cache;
+}
+
+function getSetting($key, $default = null) {
+    $cache = settingsCache();
+    return array_key_exists($key, $cache) ? $cache[$key] : $default;
+}
+
+function setSettingValue($key, $value) {
+    $db = getDB();
+    $stmt = $db->prepare('
+        INSERT OR REPLACE INTO settings (key, value, updated_at)
+        VALUES (:key, :value, CURRENT_TIMESTAMP)
+    ');
+    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    $stmt->bindValue(':value', $value, SQLITE3_TEXT);
+    $stmt->execute();
+
+    settingsCache(true);
+}
+
+function normalizeBooleanFlag($value) {
+    if (is_bool($value)) {
+        return $value;
+    }
+
+    if (is_int($value)) {
+        return $value === 1;
+    }
+
+    $stringValue = is_string($value) ? strtolower(trim($value)) : '';
+    if ($stringValue === '') {
+        return false;
+    }
+
+    return in_array($stringValue, ['1', 'true', 'yes', 'on'], true);
+}
+
+function isFeatureEnabled($settingKey, $default = false) {
+    $defaultValue = $default ? '1' : '0';
+    return normalizeBooleanFlag(getSetting($settingKey, $defaultValue));
+}
+
+function isAgeFilterEnabled() {
+    return isFeatureEnabled('age_filter_enabled', false);
+}
+
+function isKeywordFilterEnabled() {
+    return isFeatureEnabled('keyword_filter_enabled', false);
+}
+
+function isProfanityFilterEnabled() {
+    return isFeatureEnabled('profanity_filter_enabled', false);
+}
+
+function isLinkFilterEnabled() {
+    return isFeatureEnabled('link_filter_enabled', false);
+}
+
+function getFeatureSettings() {
+    return [
+        'age_filter_enabled' => isAgeFilterEnabled(),
+        'keyword_filter_enabled' => isKeywordFilterEnabled(),
+        'profanity_filter_enabled' => isProfanityFilterEnabled(),
+        'link_filter_enabled' => isLinkFilterEnabled(),
+    ];
 }
 
 function checkKeywordBlacklist($message) {
@@ -352,6 +520,10 @@ function logSecurityEvent($userId, $action, $details = '') {
 }
 
 function canUsersChatByAge($ageGroupA, $ageGroupB) {
+    if (!isAgeFilterEnabled()) {
+        return true;
+    }
+
     if (!$ageGroupA || !$ageGroupB) {
         return false;
     }
@@ -383,9 +555,27 @@ function isBlocked($userId, $otherUserId) {
 
 function cleanupOldData() {
     $db = getDB();
-    
+
     // Delete old messages
     $hours = MESSAGE_RETENTION_HOURS;
+    $attachmentResult = $db->query("SELECT attachment_path FROM messages WHERE attachment_path IS NOT NULL AND timestamp < datetime('now', '-{$hours} hours')");
+    while ($attachmentRow = $attachmentResult->fetchArray(SQLITE3_ASSOC)) {
+        $relativePath = $attachmentRow['attachment_path'] ?? '';
+        if (!$relativePath) {
+            continue;
+        }
+
+        $normalizedPath = str_replace('\\', '/', $relativePath);
+        if (strpos($normalizedPath, 'uploads/') !== 0) {
+            continue;
+        }
+
+        $fullPath = __DIR__ . '/' . $normalizedPath;
+        if (is_file($fullPath)) {
+            @unlink($fullPath);
+        }
+    }
+
     $db->exec("DELETE FROM messages WHERE timestamp < datetime('now', '-{$hours} hours')");
     
     // Delete old rate limits
@@ -451,7 +641,7 @@ function generateSessionToken() {
     return bin2hex(random_bytes(32));
 }
 
-function startUserSession($userId) {
+function startUserSession($userId, $force = false) {
     if (!$userId) {
         return ['allowed' => false, 'error' => 'Ungültige Benutzer-ID'];
     }
@@ -462,15 +652,22 @@ function startUserSession($userId) {
     $result = $stmt->execute();
     $existing = $result->fetchArray(SQLITE3_ASSOC);
 
-    if ($existing && !empty($existing['last_seen'])) {
+    if ($existing && !$force && !empty($existing['last_seen'])) {
         $secondsSinceLastSeen = time() - strtotime($existing['last_seen']);
 
         if ($secondsSinceLastSeen < ONLINE_TIMEOUT_SECONDS) {
             return [
                 'allowed' => false,
-                'error' => 'Du bist bereits auf einem anderen Gerät eingeloggt. Bitte dort zuerst ausloggen oder kurz warten.'
+                'error' => 'Du bist bereits auf einem anderen Gerät eingeloggt. Übernimm die Sitzung nur, wenn du wirklich ausgeloggt bist.',
+                'can_force' => true
             ];
         }
+    }
+
+    if ($force && $existing) {
+        $stmt = $db->prepare('DELETE FROM user_sessions WHERE user_id = :user_id');
+        $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+        $stmt->execute();
     }
 
     $token = generateSessionToken();
@@ -568,7 +765,7 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $username = trim($_POST['username'] ?? '');
         $birthdate = trim($_POST['birthdate'] ?? '');
         $agreed_terms = isset($_POST['agreed_terms']) && $_POST['agreed_terms'] === 'true';
-        
+
         // Validierung
         if (empty($username) || empty($birthdate)) {
             echo json_encode(['success' => false, 'error' => 'Username und Geburtsdatum erforderlich']);
@@ -665,7 +862,85 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         ]);
         exit;
     }
-    
+
+    // ───────────────────────────────────────────────────────
+    // LOGIN
+    // ───────────────────────────────────────────────────────
+    if ($action === 'login') {
+        $username = trim($_POST['username'] ?? '');
+        $birthdate = trim($_POST['birthdate'] ?? '');
+        $forceLogin = in_array(($_POST['force_login'] ?? '0'), ['1', 'true', 'TRUE'], true);
+
+        if ($username === '' || $birthdate === '') {
+            echo json_encode(['success' => false, 'error' => 'Bitte gib Username und Geburtsdatum ein.']);
+            exit;
+        }
+
+        $db = getDB();
+        $stmt = $db->prepare('
+            SELECT id, username, user_id as display_id, birthdate, age_group, is_banned, ban_reason
+            FROM users
+            WHERE LOWER(username) = LOWER(:username)
+            LIMIT 1
+        ');
+        $stmt->bindValue(':username', $username, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $user = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$user) {
+            echo json_encode(['success' => false, 'error' => 'Account wurde nicht gefunden.']);
+            exit;
+        }
+
+        if ((int)$user['is_banned'] === 1) {
+            $reason = $user['ban_reason'] ? (string)$user['ban_reason'] : 'Verstoß gegen Regeln';
+            echo json_encode(['success' => false, 'error' => 'Dein Account ist gesperrt: ' . $reason]);
+            exit;
+        }
+
+        if ($user['birthdate'] !== $birthdate) {
+            logSecurityEvent($user['id'], 'LOGIN_FAILED', 'Falsches Geburtsdatum');
+            echo json_encode(['success' => false, 'error' => 'Daten stimmen nicht überein.']);
+            exit;
+        }
+
+        $sessionResult = startUserSession($user['id'], $forceLogin);
+        if (!$sessionResult['allowed']) {
+            $response = [
+                'success' => false,
+                'error' => $sessionResult['error'] ?? 'Anmeldung nicht möglich.'
+            ];
+
+            if (!empty($sessionResult['can_force'])) {
+                $response['can_force'] = true;
+            }
+
+            echo json_encode($response);
+            exit;
+        }
+
+        if ($forceLogin) {
+            logSecurityEvent($user['id'], 'LOGIN_FORCE', 'Sitzung übernommen');
+        }
+
+        $_SESSION['user_id'] = $user['id'];
+        $_SESSION['username'] = $user['username'];
+        $_SESSION['user_display_id'] = $user['display_id'];
+        $_SESSION['age_group'] = $user['age_group'];
+        $_SESSION['birthdate'] = $user['birthdate'];
+
+        updateOnlineStatus($user['id']);
+        logSecurityEvent($user['id'], 'LOGIN', 'Erfolgreiche Anmeldung');
+
+        echo json_encode([
+            'success' => true,
+            'user_id' => $user['id'],
+            'display_name' => $user['username'] . '#' . $user['display_id'],
+            'age_group' => $user['age_group']
+        ]);
+        exit;
+    }
+
     // ───────────────────────────────────────────────────────
     // ADMIN LOGIN
     // ───────────────────────────────────────────────────────
@@ -744,11 +1019,14 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
         
+        $ageFilterEnabled = isAgeFilterEnabled();
+
         $query = '
             SELECT
                 u.id,
                 u.username,
                 u.user_id as display_id,
+                u.birthdate,
                 u.age_group,
                 u.last_seen,
                 CASE
@@ -782,10 +1060,12 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             AND u.is_banned = 0
         ';
 
-        if ($currentAgeGroup === 'U18') {
-            $query .= ' AND u.age_group = :allowed_group';
-        } else {
-            $query .= ' AND u.age_group != :blocked_group';
+        if ($ageFilterEnabled) {
+            if ($currentAgeGroup === 'U18') {
+                $query .= ' AND (u.age_group = :allowed_group)';
+            } else {
+                $query .= ' AND (u.age_group != :blocked_group OR u.age_group IS NULL)';
+            }
         }
 
         $query .= ' ORDER BY is_online DESC, u.username ASC';
@@ -793,32 +1073,65 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         $stmt = $db->prepare($query);
         $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
 
-        if ($currentAgeGroup === 'U18') {
-            $stmt->bindValue(':allowed_group', 'U18', SQLITE3_TEXT);
-        } else {
-            $stmt->bindValue(':blocked_group', 'U18', SQLITE3_TEXT);
+        if ($ageFilterEnabled) {
+            if ($currentAgeGroup === 'U18') {
+                $stmt->bindValue(':allowed_group', 'U18', SQLITE3_TEXT);
+            } else {
+                $stmt->bindValue(':blocked_group', 'U18', SQLITE3_TEXT);
+            }
         }
         $result = $stmt->execute();
         
         $users = [];
+        $rawCount = 0;
         while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $rawCount++;
+
+            $resolvedAgeGroup = resolveStoredAgeGroup($row['age_group'] ?? '', $row['birthdate'] ?? '');
+
+            if (!canUsersChatByAge($currentAgeGroup, $resolvedAgeGroup)) {
+                continue;
+            }
+
             // Don't show users who blocked me or I blocked
             if ($row['is_blocked_by_me'] > 0 || $row['has_blocked_me'] > 0) {
                 continue;
             }
-            
+
             $users[] = [
                 'id' => $row['id'],
                 'username' => $row['username'],
                 'display_id' => $row['display_id'],
                 'display_name' => $row['username'] . '#' . $row['display_id'],
-                'age_group' => $row['age_group'],
+                'age_group' => $resolvedAgeGroup,
                 'is_online' => $row['is_online'],
                 'unread_count' => $row['unread_count']
             ];
         }
-        
-        echo json_encode(['success' => true, 'users' => $users]);
+
+        if ($rawCount > 0 && count($users) === 0) {
+            logSecurityEvent(
+                $currentUserId,
+                'GET_USERS_FILTERED_EMPTY',
+                sprintf(
+                    'Raw: %d | AgeGroup: %s | AgeFilter: %s',
+                    $rawCount,
+                    $currentAgeGroup,
+                    $ageFilterEnabled ? 'on' : 'off'
+                )
+            );
+        }
+
+        echo json_encode([
+            'success' => true,
+            'users' => $users,
+            'diagnostics' => [
+                'raw_count' => $rawCount,
+                'filtered_count' => count($users),
+                'current_age_group' => $currentAgeGroup,
+                'feature_flags' => getFeatureSettings()
+            ]
+        ]);
         exit;
     }
     
@@ -869,6 +1182,9 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
                     m.timestamp,
                     m.is_read,
                     m.is_flagged,
+                    m.attachment_path,
+                    m.attachment_type,
+                    m.attachment_size,
                     u.username as from_username,
                     u.user_id as from_display_id
                 FROM messages m
@@ -899,6 +1215,9 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
                 'timestamp' => $row['timestamp'],
                 'is_read' => $row['is_read'],
                 'is_flagged' => $row['is_flagged'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
                 'from_username' => $row['from_username'],
                 'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
             ];
@@ -914,28 +1233,81 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     if ($action === 'send_message') {
         $toUserId = intval($_POST['to_user_id'] ?? 0);
         $message = trim($_POST['message'] ?? '');
-        
+        $hasAttachment = isset($_FILES['attachment']) && ($_FILES['attachment']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE;
+
         if ($toUserId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige User-ID']);
             exit;
         }
-        
-        if (empty($message)) {
-            echo json_encode(['success' => false, 'error' => 'Nachricht darf nicht leer sein']);
+
+        if (!$hasAttachment && $message === '') {
+            echo json_encode(['success' => false, 'error' => 'Nachricht oder Bild erforderlich']);
             exit;
         }
-        
+
         if (strlen($message) > 1000) {
             echo json_encode(['success' => false, 'error' => 'Nachricht zu lang (max 1000 Zeichen)']);
             exit;
         }
-        
+
+        $attachmentFile = $hasAttachment ? $_FILES['attachment'] : null;
+        $attachmentMime = null;
+        $attachmentSize = null;
+
+        if ($hasAttachment && $attachmentFile) {
+            if (!is_uploaded_file($attachmentFile['tmp_name'])) {
+                echo json_encode(['success' => false, 'error' => 'Ungültiger Datei-Upload']);
+                exit;
+            }
+
+            if ($attachmentFile['error'] !== UPLOAD_ERR_OK) {
+                echo json_encode(['success' => false, 'error' => 'Bild konnte nicht hochgeladen werden']);
+                exit;
+            }
+
+            if ($attachmentFile['size'] > MAX_ATTACHMENT_SIZE) {
+                echo json_encode(['success' => false, 'error' => 'Bild ist zu groß (max. 200 KB)']);
+                exit;
+            }
+
+            $attachmentSize = (int)$attachmentFile['size'];
+
+            $mime = null;
+            if (function_exists('finfo_open')) {
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                if ($finfo) {
+                    $mime = finfo_file($finfo, $attachmentFile['tmp_name']);
+                    finfo_close($finfo);
+                }
+            }
+            if (!$mime && function_exists('mime_content_type')) {
+                $mime = mime_content_type($attachmentFile['tmp_name']);
+            }
+            if (!$mime && isset($attachmentFile['type'])) {
+                $mime = $attachmentFile['type'];
+            }
+
+            $mime = strtolower((string)$mime);
+            if (!in_array($mime, ['image/jpeg', 'image/pjpeg', 'image/jpg'], true)) {
+                echo json_encode(['success' => false, 'error' => 'Nur JPG-Bilder sind erlaubt']);
+                exit;
+            }
+
+            $imageInfo = @getimagesize($attachmentFile['tmp_name']);
+            if ($imageInfo === false || !in_array($imageInfo[2], [IMAGETYPE_JPEG], true)) {
+                echo json_encode(['success' => false, 'error' => 'Bilddatei konnte nicht verifiziert werden']);
+                exit;
+            }
+
+            $attachmentMime = 'image/jpeg';
+        }
+
         // Check if blocked
         if (isBlocked(getCurrentUserId(), $toUserId)) {
             echo json_encode(['success' => false, 'error' => 'Nachricht kann nicht gesendet werden']);
             exit;
         }
-        
+
         $db = getDB();
         $currentUserId = getCurrentUserId();
         $currentAgeGroup = getCurrentAgeGroup();
@@ -963,91 +1335,125 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
             echo json_encode(['success' => false, 'error' => $rateLimitCheck['reason']]);
             exit;
         }
-        
-        // Keyword Blacklist
-        $keywordCheck = checkKeywordBlacklist($message);
-        if ($keywordCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
-            echo json_encode([
-                'success' => false,
-                'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
-                'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
-            ]);
-            exit;
+
+        if ($message !== '') {
+            if (isKeywordFilterEnabled()) {
+                // Keyword Blacklist
+                $keywordCheck = checkKeywordBlacklist($message);
+                if ($keywordCheck['blocked']) {
+                    logSecurityEvent($currentUserId, 'KEYWORD_BLOCKED', "Keyword: {$keywordCheck['keyword']}");
+                    echo json_encode([
+                        'success' => false,
+                        'error' => 'Deine Nachricht enthält nicht erlaubte Inhalte',
+                        'details' => 'Verbotenes Wort erkannt: ' . $keywordCheck['keyword']
+                    ]);
+                    exit;
+                }
+            }
+
+            if (isProfanityFilterEnabled()) {
+                // Profanity Filter
+                $profanityCheck = checkProfanityFilter($message);
+                if ($profanityCheck['blocked']) {
+                    logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
+                    echo json_encode([
+                        'success' => false,
+                        'error' => 'Deine Nachricht enthält Schimpfwörter',
+                        'details' => 'Bitte verwende eine angemessene Sprache'
+                    ]);
+                    exit;
+                }
+            }
+
+            if (isLinkFilterEnabled()) {
+                // Link Filter
+                $linkCheck = checkLinkFilter($message);
+                if ($linkCheck['blocked']) {
+                    logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
+                    echo json_encode([
+                        'success' => false,
+                        'error' => 'Links sind nicht erlaubt',
+                        'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
+                    ]);
+                    exit;
+                }
+            }
         }
-        
-        // Profanity Filter
-        $profanityCheck = checkProfanityFilter($message);
-        if ($profanityCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'PROFANITY_BLOCKED', "Word: {$profanityCheck['word']}");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Deine Nachricht enthält Schimpfwörter',
-                'details' => 'Bitte verwende eine angemessene Sprache'
-            ]);
-            exit;
-        }
-        
-        // Link Filter
-        $linkCheck = checkLinkFilter($message);
-        if ($linkCheck['blocked']) {
-            logSecurityEvent($currentUserId, 'LINK_BLOCKED', "Message: $message");
-            echo json_encode([
-                'success' => false, 
-                'error' => 'Links sind nicht erlaubt',
-                'details' => 'Aus Sicherheitsgründen können keine URLs gesendet werden'
-            ]);
-            exit;
-        }
-        
+
         // Auto-Flagging (verdächtige Muster)
         $isFlagged = 0;
         $flagReason = '';
-        
-        // Check for repeated characters (AAAAAAA)
-        if (preg_match('/(.)\1{5,}/', $message)) {
-            $isFlagged = 1;
-            $flagReason = 'Repeated characters';
+
+        if ($message !== '') {
+            if (preg_match('/(.)\1{5,}/', $message)) {
+                $isFlagged = 1;
+                $flagReason = 'Repeated characters';
+            }
+
+            if (strlen($message) > 20 && $message === strtoupper($message)) {
+                $isFlagged = 1;
+                $flagReason = 'All caps';
+            }
+
+            $emojiCount = preg_match_all('/[\x{1F600}-\x{1F64F}]/u', $message);
+            if ($emojiCount > 10) {
+                $isFlagged = 1;
+                $flagReason = 'Excessive emojis';
+            }
         }
-        
-        // Check for all caps (min 20 chars)
-        if (strlen($message) > 20 && $message === strtoupper($message)) {
-            $isFlagged = 1;
-            $flagReason = 'All caps';
+
+        $attachmentPath = null;
+        if ($hasAttachment && $attachmentFile) {
+            $randomName = bin2hex(random_bytes(16)) . '.jpg';
+            $destination = rtrim(UPLOAD_DIR, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $randomName;
+
+            if (!move_uploaded_file($attachmentFile['tmp_name'], $destination)) {
+                echo json_encode(['success' => false, 'error' => 'Bild konnte nicht gespeichert werden']);
+                exit;
+            }
+
+            $attachmentPath = 'uploads/' . $randomName;
         }
-        
-        // Check for excessive emojis
-        $emojiCount = preg_match_all('/[\x{1F600}-\x{1F64F}]/u', $message);
-        if ($emojiCount > 10) {
-            $isFlagged = 1;
-            $flagReason = 'Excessive emojis';
-        }
-        
+
         // Insert message
         $stmt = $db->prepare('
-            INSERT INTO messages (from_user_id, to_user_id, message, is_flagged, flag_reason)
-            VALUES (:from_user_id, :to_user_id, :message, :is_flagged, :flag_reason)
+            INSERT INTO messages (from_user_id, to_user_id, message, is_flagged, flag_reason, attachment_path, attachment_type, attachment_size)
+            VALUES (:from_user_id, :to_user_id, :message, :is_flagged, :flag_reason, :attachment_path, :attachment_type, :attachment_size)
         ');
         $stmt->bindValue(':from_user_id', $currentUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':to_user_id', $toUserId, SQLITE3_INTEGER);
         $stmt->bindValue(':message', $message, SQLITE3_TEXT);
         $stmt->bindValue(':is_flagged', $isFlagged, SQLITE3_INTEGER);
         $stmt->bindValue(':flag_reason', $flagReason, SQLITE3_TEXT);
+        if ($attachmentPath) {
+            $stmt->bindValue(':attachment_path', $attachmentPath, SQLITE3_TEXT);
+            $stmt->bindValue(':attachment_type', $attachmentMime, SQLITE3_TEXT);
+            $stmt->bindValue(':attachment_size', $attachmentSize, SQLITE3_INTEGER);
+        } else {
+            $stmt->bindValue(':attachment_path', null, SQLITE3_NULL);
+            $stmt->bindValue(':attachment_type', null, SQLITE3_NULL);
+            $stmt->bindValue(':attachment_size', null, SQLITE3_NULL);
+        }
         $stmt->execute();
-        
+
         $messageId = $db->lastInsertRowID();
-        
+
         // Log rate limit
         logRateLimit($currentUserId);
-        
+
         if ($isFlagged) {
             logSecurityEvent($currentUserId, 'MESSAGE_FLAGGED', "Reason: $flagReason, Message ID: $messageId");
         }
-        
+
+        if ($attachmentPath) {
+            logSecurityEvent($currentUserId, 'ATTACHMENT_UPLOADED', "Message ID: $messageId, Size: $attachmentSize");
+        }
+
         echo json_encode([
             'success' => true,
             'message_id' => $messageId,
-            'timestamp' => date('Y-m-d H:i:s')
+            'timestamp' => date('Y-m-d H:i:s'),
+            'attachment_url' => $attachmentPath
         ]);
         exit;
     }
@@ -1370,15 +1776,47 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
         echo json_encode([
             'success' => true,
             'stats' => [
-                'total_users' => $totalUsers,
-                'u18_users' => $u18Users,
-                'o18_users' => $o18Users,
-                'online_users' => $onlineUsers,
-                'total_messages' => $totalMessages,
-                'flagged_messages' => $flaggedMessages,
-                'pending_reports' => $pendingReports,
-                'banned_users' => $bannedUsers
+                'total_users' => (int)$totalUsers,
+                'u18_users' => (int)$u18Users,
+                'o18_users' => (int)$o18Users,
+                'online_users' => (int)$onlineUsers,
+                'total_messages' => (int)$totalMessages,
+                'flagged_messages' => (int)$flaggedMessages,
+                'pending_reports' => (int)$pendingReports,
+                'banned_users' => (int)$bannedUsers
             ]
+        ]);
+        exit;
+    }
+
+    if ($action === 'admin_get_settings') {
+        echo json_encode([
+            'success' => true,
+            'settings' => getFeatureSettings()
+        ]);
+        exit;
+    }
+
+    if ($action === 'admin_update_settings') {
+        $allowedKeys = [
+            'age_filter_enabled',
+            'keyword_filter_enabled',
+            'profanity_filter_enabled',
+            'link_filter_enabled'
+        ];
+
+        $updatedValues = [];
+        foreach ($allowedKeys as $key) {
+            $value = normalizeBooleanFlag($_POST[$key] ?? '0') ? '1' : '0';
+            setSettingValue($key, $value);
+            $updatedValues[$key] = $value;
+        }
+
+        logSecurityEvent(null, 'ADMIN_UPDATE_SETTINGS', json_encode($updatedValues));
+
+        echo json_encode([
+            'success' => true,
+            'settings' => getFeatureSettings()
         ]);
         exit;
     }
@@ -1495,23 +1933,106 @@ if (isset($_POST['action']) || isset($_GET['action'])) {
     // ───────────────────────────────────────────────────────
     if ($action === 'admin_delete_message') {
         $messageId = intval($_POST['message_id'] ?? 0);
-        
+
         if ($messageId <= 0) {
             echo json_encode(['success' => false, 'error' => 'Ungültige Message-ID']);
             exit;
         }
-        
+
         $db = getDB();
         $stmt = $db->prepare('DELETE FROM messages WHERE id = :message_id');
         $stmt->bindValue(':message_id', $messageId, SQLITE3_INTEGER);
         $stmt->execute();
-        
+
         logSecurityEvent(null, 'ADMIN_DELETE_MESSAGE', "Message ID: $messageId");
-        
+
         echo json_encode(['success' => true, 'message' => 'Nachricht wurde gelöscht']);
         exit;
     }
-    
+
+    if ($action === 'poll_updates') {
+        if (!isLoggedIn()) {
+            echo json_encode(['success' => false, 'error' => 'Nicht angemeldet']);
+            exit;
+        }
+
+        if (!validateActiveSession()) {
+            echo json_encode(['success' => false, 'error' => 'Sitzung ungültig']);
+            exit;
+        }
+
+        $lastMessageId = intval($_POST['last_message_id'] ?? $_GET['last_message_id'] ?? 0);
+
+        $db = getDB();
+        $currentUserId = getCurrentUserId();
+        $currentAgeGroup = getCurrentAgeGroup();
+
+        touchUserSession($currentUserId);
+
+        $stmt = $db->prepare('
+            SELECT
+                m.id,
+                m.from_user_id,
+                m.to_user_id,
+                m.message,
+                m.timestamp,
+                m.attachment_path,
+                m.attachment_type,
+                m.attachment_size,
+                uf.username as from_username,
+                uf.user_id as from_display_id,
+                uf.age_group as from_age_group,
+                ut.age_group as to_age_group
+            FROM messages m
+            JOIN users uf ON m.from_user_id = uf.id
+            JOIN users ut ON m.to_user_id = ut.id
+            WHERE m.id > :last_message_id
+            AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
+            AND NOT EXISTS (
+                SELECT 1 FROM blocks
+                WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
+                OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
+            )
+            ORDER BY m.id ASC
+        ');
+        $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
+        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+
+        $messages = [];
+        $maxId = $lastMessageId;
+
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+            if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+                continue;
+            }
+
+            $maxId = max($maxId, (int)$row['id']);
+
+            $messages[] = [
+                'id' => $row['id'],
+                'from_user_id' => $row['from_user_id'],
+                'to_user_id' => $row['to_user_id'],
+                'message' => $row['message'],
+                'timestamp' => $row['timestamp'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
+                'from_username' => $row['from_username'],
+                'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
+            ];
+        }
+
+        echo json_encode([
+            'success' => true,
+            'messages' => $messages,
+            'last_message_id' => $maxId
+        ]);
+        exit;
+    }
+
     echo json_encode(['success' => false, 'error' => 'Unbekannte Aktion']);
     exit;
 }
@@ -1549,63 +2070,85 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     echo ": connected\n\n";
     echo "retry: " . SSE_RETRY_MS . "\n\n";
     flush();
-    
-    $db = getDB();
-    
-    $stmt = $db->prepare('
-        SELECT
-            m.id,
-            m.from_user_id,
-            m.to_user_id,
-            m.message,
-            m.timestamp,
-            uf.username as from_username,
-            uf.user_id as from_display_id,
-            uf.age_group as from_age_group,
-            ut.age_group as to_age_group
-        FROM messages m
-        JOIN users uf ON m.from_user_id = uf.id
-        JOIN users ut ON m.to_user_id = ut.id
-        WHERE m.id > :last_message_id
-        AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
-        AND NOT EXISTS (
-            SELECT 1 FROM blocks
-            WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
-            OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
-        )
-        ORDER BY m.id ASC
-    ');
-    $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
-    $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $messages = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
 
-        if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
-            continue;
+    $lastPingTime = time();
+
+    while (true) {
+        if (connection_aborted()) {
+            break;
         }
 
-        $messages[] = [
-            'id' => $row['id'],
-            'from_user_id' => $row['from_user_id'],
-            'to_user_id' => $row['to_user_id'],
-            'message' => $row['message'],
-            'timestamp' => $row['timestamp'],
-            'from_username' => $row['from_username'],
-            'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
-        ];
+        $db = getDB();
+
+        $stmt = $db->prepare('
+            SELECT
+                m.id,
+                m.from_user_id,
+                m.to_user_id,
+                m.message,
+                m.timestamp,
+                m.attachment_path,
+                m.attachment_type,
+                m.attachment_size,
+                uf.username as from_username,
+                uf.user_id as from_display_id,
+                uf.age_group as from_age_group,
+                ut.age_group as to_age_group
+            FROM messages m
+            JOIN users uf ON m.from_user_id = uf.id
+            JOIN users ut ON m.to_user_id = ut.id
+            WHERE m.id > :last_message_id
+            AND (m.to_user_id = :current_user_id OR m.from_user_id = :current_user_id)
+            AND NOT EXISTS (
+                SELECT 1 FROM blocks
+                WHERE (blocker_id = :current_user_id AND blocked_id = m.from_user_id)
+                OR (blocker_id = m.from_user_id AND blocked_id = :current_user_id)
+            )
+            ORDER BY m.id ASC
+        ');
+        $stmt->bindValue(':last_message_id', $lastMessageId, SQLITE3_INTEGER);
+        $stmt->bindValue(':current_user_id', $currentUserId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+
+        $messages = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $otherAgeGroup = $row['from_user_id'] === $currentUserId ? $row['to_age_group'] : $row['from_age_group'];
+
+            if (!canUsersChatByAge($currentAgeGroup, $otherAgeGroup)) {
+                continue;
+            }
+
+            $messages[] = [
+                'id' => $row['id'],
+                'from_user_id' => $row['from_user_id'],
+                'to_user_id' => $row['to_user_id'],
+                'message' => $row['message'],
+                'timestamp' => $row['timestamp'],
+                'attachment_url' => $row['attachment_path'] ?: null,
+                'attachment_type' => $row['attachment_type'] ?: null,
+                'attachment_size' => $row['attachment_size'] !== null ? (int)$row['attachment_size'] : null,
+                'from_username' => $row['from_username'],
+                'from_display_name' => $row['from_username'] . '#' . $row['from_display_id']
+            ];
+
+            $lastMessageId = max($lastMessageId, (int)$row['id']);
+        }
+
+        if (!empty($messages)) {
+            echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
+            flush();
+        }
+
+        if (time() - $lastPingTime >= 15) {
+            echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
+            flush();
+            $lastPingTime = time();
+            touchUserSession($currentUserId);
+        }
+
+        usleep(500000);
     }
-    
-    if (!empty($messages)) {
-        echo "data: " . json_encode(['type' => 'messages', 'messages' => $messages]) . "\n\n";
-        flush();
-    } else {
-        echo "data: " . json_encode(['type' => 'ping']) . "\n\n";
-        flush();
-    }
-    
+
     exit;
 }
 
@@ -1646,6 +2189,7 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
             background: linear-gradient(135deg, #fef08a 0%, #f97316 100%);
+            background-color: #fff9db;
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -1962,6 +2506,48 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             color: var(--sun-700);
         }
 
+        .admin-settings-form {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin-top: 10px;
+        }
+
+        .admin-settings-toggle {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .admin-settings-toggle input {
+            margin-top: 4px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .admin-settings-toggle strong {
+            display: block;
+            font-size: 15px;
+            color: var(--sun-800);
+        }
+
+        .admin-settings-description {
+            font-size: 13px;
+            color: rgba(120, 53, 15, 0.75);
+            margin-top: 2px;
+        }
+
+        .admin-settings-status {
+            margin-top: 12px;
+            font-size: 13px;
+            color: #2563eb;
+        }
+
+        .admin-settings-status.error {
+            color: #dc2626;
+        }
+
         .admin-table-wrapper {
             overflow-x: auto;
         }
@@ -2051,7 +2637,70 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             display: none;
             font-size: 14px;
         }
-        
+
+        .auth-toggle {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 18px;
+            background: rgba(255, 221, 87, 0.2);
+            padding: 6px;
+            border-radius: 999px;
+        }
+
+        .auth-toggle button {
+            flex: 1;
+            border: none;
+            border-radius: 999px;
+            padding: 10px 12px;
+            font-weight: 600;
+            cursor: pointer;
+            background: transparent;
+            color: #92400e;
+            transition: background 0.2s ease, color 0.2s ease;
+        }
+
+        .auth-toggle button.active {
+            background: linear-gradient(135deg, var(--sun-400), var(--sun-500));
+            color: #ffffff;
+            box-shadow: 0 8px 16px rgba(188, 118, 0, 0.25);
+        }
+
+        .auth-form.hidden {
+            display: none;
+        }
+
+        .form-helper {
+            font-size: 13px;
+            color: #92400e;
+            margin-top: -8px;
+            margin-bottom: 16px;
+        }
+
+        .force-login-box {
+            background: #fff7ed;
+            border: 1px solid rgba(217, 119, 6, 0.25);
+            border-radius: 12px;
+            padding: 12px;
+            margin-bottom: 16px;
+            display: none;
+        }
+
+        .force-login-box p {
+            margin: 0 0 12px;
+            font-size: 13px;
+            color: #92400e;
+        }
+
+        .force-login-box button {
+            background: var(--sun-500);
+            color: #fff;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 10px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
         .success-message {
             background: #d4edda;
             color: #155724;
@@ -2403,11 +3052,12 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             border-top: 1px solid rgba(188, 118, 0, 0.18);
             display: flex;
             gap: 12px;
-            align-items: center;
+            align-items: flex-end;
+            flex-wrap: wrap;
         }
 
         .chat-input {
-            flex: 1;
+            flex: 1 1 auto;
             padding: 12px 16px;
             border: 1px solid rgba(188, 118, 0, 0.28);
             border-radius: 28px;
@@ -2423,6 +3073,54 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             outline: none;
             border-color: var(--sun-600);
             box-shadow: 0 0 0 3px rgba(240, 180, 0, 0.18);
+        }
+
+        .chat-input-tools {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .attach-button {
+            background: white;
+            border: 1px dashed rgba(240, 180, 0, 0.6);
+            color: var(--sun-700);
+            padding: 10px 16px;
+            border-radius: 24px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+        }
+
+        .attach-button:hover {
+            transform: translateY(-1px);
+            border-color: var(--sun-700);
+            box-shadow: 0 10px 18px rgba(240, 180, 0, 0.18);
+        }
+
+        .attachment-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(251, 191, 36, 0.18);
+            border: 1px solid rgba(240, 180, 0, 0.35);
+            border-radius: 20px;
+            padding: 6px 12px;
+            font-size: 13px;
+            color: var(--sun-800);
+        }
+
+        .attachment-remove {
+            background: none;
+            border: none;
+            color: #b91c1c;
+            font-size: 14px;
+            cursor: pointer;
+            padding: 0;
+        }
+
+        .attachment-remove:hover {
+            color: #7f1d1d;
         }
 
         .send-button {
@@ -2448,6 +3146,30 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
             box-shadow: none;
         }
 
+        .attachment-warning {
+            margin: 0 24px 12px;
+            color: #b91c1c;
+            font-size: 13px;
+        }
+
+        .message-attachment {
+            margin-top: 6px;
+        }
+
+        .message-attachment a {
+            display: inline-block;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 6px 18px rgba(60, 42, 0, 0.22);
+            background: rgba(255, 255, 255, 0.85);
+        }
+
+        .message-attachment img {
+            display: block;
+            max-width: 220px;
+            height: auto;
+        }
+
         .empty-user-list,
         .empty-messages,
         .loading-state,
@@ -2469,6 +3191,14 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 
         .error-state {
             color: #c2410c;
+        }
+
+        .user-list-error-banner {
+            margin: 12px 16px;
+            border-radius: 10px;
+            background: rgba(255, 237, 213, 0.85);
+            border: 1px solid rgba(251, 146, 60, 0.35);
+            padding: 12px 14px;
         }
 
         .chat-state-message.hidden {
@@ -2502,6 +3232,51 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
         </div>
 
         <div class="admin-sections">
+            <div class="admin-section">
+                <div class="admin-section-header">
+                    <h2>⚙️ Sicherheitsfilter</h2>
+                </div>
+                <form id="adminSettingsForm" class="admin-settings-form">
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="age_filter_enabled">
+                        <div>
+                            <strong>Altersfilter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Wenn aktiviert, können nur Nutzer derselben Altersgruppe miteinander chatten.
+                            </div>
+                        </div>
+                    </label>
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="keyword_filter_enabled">
+                        <div>
+                            <strong>Keyword-Filter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Blockiert Nachrichten mit sensiblen Schlüsselwörtern (Adressen, Treffen usw.).
+                            </div>
+                        </div>
+                    </label>
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="profanity_filter_enabled">
+                        <div>
+                            <strong>Schimpfwort-Filter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Verhindert das Versenden von beleidigenden Ausdrücken.
+                            </div>
+                        </div>
+                    </label>
+                    <label class="admin-settings-toggle">
+                        <input type="checkbox" name="link_filter_enabled">
+                        <div>
+                            <strong>Link-Filter aktivieren</strong>
+                            <div class="admin-settings-description">
+                                Unterbindet das Versenden von URLs und externen Links.
+                            </div>
+                        </div>
+                    </label>
+                </form>
+                <div class="admin-settings-status" id="adminSettingsStatus"></div>
+            </div>
+
             <div class="admin-section">
                 <div class="admin-section-header">
                     <h2>🚨 Offene Meldungen</h2>
@@ -2558,20 +3333,26 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
     <div class="auth-container">
         <h1>💬 Secure Private Chat</h1>
         <p class="subtitle">Sicherer Chat mit Altersverifikation</p>
-        
-        <div class="error-message" id="errorMessage"></div>
-        
-        <form id="registerForm">
+
+        <div class="auth-toggle">
+            <button type="button" class="auth-toggle-button active" data-target="register">Registrieren</button>
+            <button type="button" class="auth-toggle-button" data-target="login">Einloggen</button>
+        </div>
+
+        <div class="error-message" id="registerError"></div>
+        <div class="error-message" id="loginError"></div>
+
+        <form id="registerForm" class="auth-form">
             <div class="form-group">
                 <label>Username (3-15 Zeichen)</label>
                 <input type="text" id="username" maxlength="15" required>
             </div>
-            
+
             <div class="form-group">
                 <label>Geburtsdatum</label>
                 <input type="date" id="birthdate" required>
             </div>
-            
+
             <div class="terms-box">
                 <h3>⚠️ Wichtige Regeln</h3>
                 <ul>
@@ -2587,10 +3368,31 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                 <input type="checkbox" id="agreeTerms" required>
                 <label for="agreeTerms">Ich akzeptiere die Nutzungsbedingungen</label>
             </div>
-            
+
             <button type="submit" class="btn-primary">Chat beitreten</button>
         </form>
-        
+
+        <form id="loginForm" class="auth-form hidden">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="loginUsername" maxlength="15" autocomplete="username" required>
+            </div>
+
+            <div class="form-group">
+                <label>Geburtsdatum</label>
+                <input type="date" id="loginBirthdate" autocomplete="bday" required>
+            </div>
+
+            <p class="form-helper">Nutze dein registriertes Geburtsdatum zur Bestätigung deiner Identität.</p>
+
+            <div class="force-login-box" id="loginTakeoverBox">
+                <p>Deine vorige Sitzung scheint noch aktiv zu sein. Du kannst sie hier übernehmen, falls du sicher bist, dass du ausgeloggt bist.</p>
+                <button type="button" id="loginTakeoverBtn">Sitzung übernehmen</button>
+            </div>
+
+            <button type="submit" class="btn-primary">Einloggen</button>
+        </form>
+
         <div class="admin-link">
             <a href="?admin=1">Admin-Login</a>
         </div>
@@ -2637,9 +3439,18 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
                 </div>
                 
                 <div class="chat-input-container">
+                    <div class="chat-input-tools">
+                        <button type="button" class="attach-button" id="attachmentButton" title="Bild anhängen">📎 Bild</button>
+                        <input type="file" id="attachmentInput" accept="image/jpeg" class="hidden" />
+                        <div class="attachment-info hidden" id="attachmentInfo">
+                            <span id="attachmentFileName"></span>
+                            <button type="button" class="attachment-remove" id="attachmentClearBtn" aria-label="Anhang entfernen">✕</button>
+                        </div>
+                    </div>
                     <textarea class="chat-input" id="chatInput" placeholder="Nachricht schreiben..." rows="1" maxlength="1000"></textarea>
                     <button class="send-button" id="sendButton">Senden</button>
                 </div>
+                <div class="attachment-warning hidden" id="attachmentWarning"></div>
             </div>
         </div>
     </div>
@@ -2650,12 +3461,46 @@ if (isset($_GET['stream']) && $_GET['stream'] === 'events') {
 // JAVASCRIPT
 // ═══════════════════════════════════════════════════════════
 
+const currentUrl = new URL(window.location.href);
+const basePath = currentUrl.pathname;
+const baseParams = new URLSearchParams(currentUrl.search);
+const postTarget = `${currentUrl.origin}${basePath}${baseParams.toString() ? `?${baseParams.toString()}` : ''}`;
+
+function buildUrl(params = {}) {
+    const url = new URL(basePath, window.location.origin);
+    baseParams.forEach((value, key) => {
+        if (!Object.prototype.hasOwnProperty.call(params, key)) {
+            url.searchParams.set(key, value);
+        }
+    });
+
+    Object.entries(params).forEach(([key, value]) => {
+        if (value === null || value === undefined) {
+            return;
+        }
+        url.searchParams.set(key, value);
+    });
+
+    return url.toString();
+}
+
+function postFormData(formData) {
+    return fetch(postTarget, {
+        method: 'POST',
+        body: formData,
+        credentials: 'same-origin'
+    });
+}
+
 <?php if (isAdmin()): ?>
 // ADMIN DASHBOARD
 const adminStatsGrid = document.getElementById('adminStatsGrid');
 const adminReportsContainer = document.getElementById('adminReportsContainer');
 const adminFlaggedContainer = document.getElementById('adminFlaggedContainer');
 const adminBannedContainer = document.getElementById('adminBannedContainer');
+const adminSettingsForm = document.getElementById('adminSettingsForm');
+const adminSettingsStatus = document.getElementById('adminSettingsStatus');
+let adminSettingsMessageTimer = null;
 
 function adminEscapeHtml(text) {
     const div = document.createElement('div');
@@ -2677,9 +3522,116 @@ async function adminFetch(action, payload = {}) {
     formData.append('action', action);
     Object.entries(payload).forEach(([key, val]) => formData.append(key, val));
 
-    const response = await fetch('', { method: 'POST', body: formData });
+    const response = await postFormData(formData);
     return response.json();
 }
+
+function parseAdminBoolean(value) {
+    if (value === true || value === false) {
+        return value;
+    }
+
+    if (typeof value === 'number') {
+        return value === 1;
+    }
+
+    if (typeof value === 'string') {
+        return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+    }
+
+    return false;
+}
+
+function setAdminSettingsStatus(message, isError = false) {
+    if (!adminSettingsStatus) {
+        return;
+    }
+
+    if (adminSettingsMessageTimer) {
+        clearTimeout(adminSettingsMessageTimer);
+        adminSettingsMessageTimer = null;
+    }
+
+    adminSettingsStatus.textContent = message || '';
+    adminSettingsStatus.classList.toggle('error', Boolean(isError && message));
+
+    if (message && !isError) {
+        adminSettingsMessageTimer = setTimeout(() => {
+            if (adminSettingsStatus.textContent === message) {
+                adminSettingsStatus.textContent = '';
+            }
+        }, 2500);
+    }
+}
+
+function applyAdminSettings(settings) {
+    if (!adminSettingsForm || !settings) {
+        return;
+    }
+
+    const keys = ['age_filter_enabled', 'keyword_filter_enabled', 'profanity_filter_enabled', 'link_filter_enabled'];
+    keys.forEach((key) => {
+        const input = adminSettingsForm.elements.namedItem(key);
+        if (input) {
+            input.checked = parseAdminBoolean(settings[key]);
+        }
+    });
+}
+
+async function loadAdminSettings() {
+    if (!adminSettingsForm) {
+        return;
+    }
+
+    try {
+        const response = await fetch(buildUrl({ action: 'admin_get_settings' }), { credentials: 'same-origin' });
+        if (!response.ok) {
+            throw new Error('Einstellungen konnten nicht geladen werden.');
+        }
+
+        const result = await response.json();
+        if (!result.success) {
+            throw new Error(result.error || 'Einstellungen konnten nicht geladen werden.');
+        }
+
+        applyAdminSettings(result.settings || {});
+        setAdminSettingsStatus('');
+    } catch (error) {
+        setAdminSettingsStatus(error.message || 'Einstellungen konnten nicht geladen werden.', true);
+    }
+}
+
+async function saveAdminSettings() {
+    if (!adminSettingsForm) {
+        return;
+    }
+
+    const payload = {};
+    const keys = ['age_filter_enabled', 'keyword_filter_enabled', 'profanity_filter_enabled', 'link_filter_enabled'];
+    keys.forEach((key) => {
+        const input = adminSettingsForm.elements.namedItem(key);
+        if (input) {
+            payload[key] = input.checked ? '1' : '0';
+        }
+    });
+
+    try {
+        setAdminSettingsStatus('Speichere…');
+        const result = await adminFetch('admin_update_settings', payload);
+        if (!result.success) {
+            throw new Error(result.error || 'Speichern fehlgeschlagen.');
+        }
+
+        applyAdminSettings(result.settings || {});
+        setAdminSettingsStatus('Einstellungen gespeichert.');
+    } catch (error) {
+        setAdminSettingsStatus(error.message || 'Speichern fehlgeschlagen.', true);
+    }
+}
+
+adminSettingsForm?.addEventListener('change', () => {
+    saveAdminSettings();
+});
 
 function renderAdminStats(stats) {
     if (!stats) {
@@ -2838,7 +3790,7 @@ function renderBanned(banned) {
 }
 
 async function loadAdminStats() {
-    const response = await fetch('?action=admin_get_stats');
+    const response = await fetch(buildUrl({ action: 'admin_get_stats' }), { credentials: 'same-origin' });
     const result = await response.json();
     if (result.success) {
         renderAdminStats(result.stats);
@@ -2846,7 +3798,7 @@ async function loadAdminStats() {
 }
 
 async function loadAdminReports() {
-    const response = await fetch('?action=admin_get_reports');
+    const response = await fetch(buildUrl({ action: 'admin_get_reports' }), { credentials: 'same-origin' });
     const result = await response.json();
     if (result.success) {
         renderReports(result.reports);
@@ -2854,7 +3806,7 @@ async function loadAdminReports() {
 }
 
 async function loadAdminFlagged() {
-    const response = await fetch('?action=admin_get_flagged');
+    const response = await fetch(buildUrl({ action: 'admin_get_flagged' }), { credentials: 'same-origin' });
     const result = await response.json();
     if (result.success) {
         renderFlagged(result.flagged);
@@ -2862,7 +3814,7 @@ async function loadAdminFlagged() {
 }
 
 async function loadAdminBanned() {
-    const result = await fetch('?action=admin_get_banned_users');
+    const result = await fetch(buildUrl({ action: 'admin_get_banned_users' }), { credentials: 'same-origin' });
     const data = await result.json();
     if (data.success) {
         renderBanned(data.banned);
@@ -2918,7 +3870,8 @@ async function refreshAdminData() {
         loadAdminStats(),
         loadAdminReports(),
         loadAdminFlagged(),
-        loadAdminBanned()
+        loadAdminBanned(),
+        loadAdminSettings()
     ]);
 }
 
@@ -2945,7 +3898,7 @@ adminLoginForm.addEventListener('submit', async (e) => {
     formData.append('password', document.getElementById('adminPassword').value);
 
     try {
-        const response = await fetch('', { method: 'POST', body: formData });
+        const response = await postFormData(formData);
         const result = await response.json();
 
         if (result.success) {
@@ -2961,9 +3914,49 @@ adminLoginForm.addEventListener('submit', async (e) => {
 });
 
 <?php elseif (!isLoggedIn()): ?>
-// REGISTRATION
-document.getElementById('registerForm').addEventListener('submit', async (e) => {
+// AUTH FORMS
+const authToggleButtons = document.querySelectorAll('.auth-toggle-button');
+const registerForm = document.getElementById('registerForm');
+const loginForm = document.getElementById('loginForm');
+const registerErrorEl = document.getElementById('registerError');
+const loginErrorEl = document.getElementById('loginError');
+const loginTakeoverBox = document.getElementById('loginTakeoverBox');
+const loginTakeoverBtn = document.getElementById('loginTakeoverBtn');
+let lastLoginCredentials = null;
+let isSubmittingLogin = false;
+
+function hideElement(el) {
+    if (!el) return;
+    el.style.display = 'none';
+    el.textContent = '';
+}
+
+function showAuthView(view) {
+    if (view === 'login') {
+        registerForm?.classList.add('hidden');
+        loginForm?.classList.remove('hidden');
+        hideElement(registerErrorEl);
+    } else {
+        loginForm?.classList.add('hidden');
+        registerForm?.classList.remove('hidden');
+        hideElement(loginErrorEl);
+        if (loginTakeoverBox) {
+            loginTakeoverBox.style.display = 'none';
+        }
+    }
+}
+
+authToggleButtons.forEach(button => {
+    button.addEventListener('click', () => {
+        authToggleButtons.forEach(btn => btn.classList.toggle('active', btn === button));
+        showAuthView(button.dataset.target === 'login' ? 'login' : 'register');
+    });
+});
+
+registerForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
+
+    hideElement(registerErrorEl);
 
     const username = document.getElementById('username').value.trim();
     const birthdate = document.getElementById('birthdate').value;
@@ -2973,22 +3966,97 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
     formData.append('action', 'register');
     formData.append('username', username);
     formData.append('birthdate', birthdate);
-    formData.append('agreed_terms', agreedTerms);
+    formData.append('agreed_terms', agreedTerms ? 'true' : 'false');
 
     try {
-        const response = await fetch('', { method: 'POST', body: formData });
+        const response = await postFormData(formData);
         const result = await response.json();
 
         if (result.success) {
             window.location.reload();
-        } else {
-            document.getElementById('errorMessage').textContent = result.error;
-            document.getElementById('errorMessage').style.display = 'block';
+        } else if (registerErrorEl) {
+            registerErrorEl.textContent = result.error || 'Registrierung fehlgeschlagen.';
+            registerErrorEl.style.display = 'block';
         }
     } catch (error) {
-        document.getElementById('errorMessage').textContent = 'Verbindungsfehler';
-        document.getElementById('errorMessage').style.display = 'block';
+        if (registerErrorEl) {
+            registerErrorEl.textContent = 'Verbindungsfehler';
+            registerErrorEl.style.display = 'block';
+        }
     }
+});
+
+async function submitLogin(force = false) {
+    if (!lastLoginCredentials || isSubmittingLogin) {
+        return;
+    }
+
+    isSubmittingLogin = true;
+
+    if (loginErrorEl) {
+        loginErrorEl.textContent = '';
+        loginErrorEl.style.display = 'none';
+    }
+
+    if (loginTakeoverBox) {
+        loginTakeoverBox.style.display = 'none';
+    }
+
+    const formData = new FormData();
+    formData.append('action', 'login');
+    formData.append('username', lastLoginCredentials.username);
+    formData.append('birthdate', lastLoginCredentials.birthdate);
+    formData.append('force_login', force ? '1' : '0');
+
+    try {
+        const response = await postFormData(formData);
+        const result = await response.json();
+
+        if (result.success) {
+            window.location.reload();
+            return;
+        }
+
+        if (loginErrorEl) {
+            loginErrorEl.textContent = result.error || 'Anmeldung fehlgeschlagen.';
+            loginErrorEl.style.display = 'block';
+        }
+
+        if (result.can_force && loginTakeoverBox) {
+            loginTakeoverBox.style.display = 'block';
+        }
+    } catch (error) {
+        if (loginErrorEl) {
+            loginErrorEl.textContent = 'Verbindungsfehler';
+            loginErrorEl.style.display = 'block';
+        }
+    } finally {
+        isSubmittingLogin = false;
+    }
+}
+
+loginForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    if (loginErrorEl) {
+        loginErrorEl.textContent = '';
+        loginErrorEl.style.display = 'none';
+    }
+
+    if (loginTakeoverBox) {
+        loginTakeoverBox.style.display = 'none';
+    }
+
+    lastLoginCredentials = {
+        username: document.getElementById('loginUsername').value.trim(),
+        birthdate: document.getElementById('loginBirthdate').value
+    };
+
+    await submitLogin(false);
+});
+
+loginTakeoverBtn?.addEventListener('click', async () => {
+    await submitLogin(true);
 });
 
 <?php else: ?>
@@ -3015,6 +4083,258 @@ const chatStateMessageEl = document.getElementById('chatStateMessage');
 const chatMessagesHeaderEl = document.getElementById('chatMessagesHeader');
 const chatInputEl = document.getElementById('chatInput');
 const sendButtonEl = document.getElementById('sendButton');
+const attachmentButtonEl = document.getElementById('attachmentButton');
+const attachmentInputEl = document.getElementById('attachmentInput');
+const attachmentInfoEl = document.getElementById('attachmentInfo');
+const attachmentFileNameEl = document.getElementById('attachmentFileName');
+const attachmentClearBtnEl = document.getElementById('attachmentClearBtn');
+const attachmentWarningEl = document.getElementById('attachmentWarning');
+const ATTACHMENT_MAX_SIZE = 200 * 1024;
+let messageAbortController = null;
+let sseErrorCount = 0;
+let usePollingFallback = false;
+let pollingTimerId = null;
+let isPollingUpdates = false;
+const POLLING_INTERVAL_MS = 5000;
+const WATCHDOG_INTERVAL_MS = 10000;
+const SSE_RECOVERY_INTERVAL_MS = 15000;
+let connectivityTimerId = null;
+let consecutivePingFailures = 0;
+let lastRecoveryAttemptAt = 0;
+let probeController = null;
+
+function buildSSEUrl() {
+    return buildUrl({ stream: 'events', last_message_id: state.lastMessageId, t: Date.now() });
+}
+
+async function connectivityPing() {
+    const formData = new FormData();
+    formData.append('action', 'ping');
+
+    try {
+        const response = await postFormData(formData);
+        if (!response.ok) {
+            throw new Error(`HTTP_${response.status}`);
+        }
+
+        await response.json().catch(() => ({}));
+
+        consecutivePingFailures = 0;
+
+        if (usePollingFallback) {
+            tryRecoverRealtime();
+        }
+    } catch (error) {
+        consecutivePingFailures += 1;
+        console.warn('Ping fehlgeschlagen:', error);
+
+        if (consecutivePingFailures >= 2) {
+            enablePollingFallback();
+        }
+    }
+}
+
+function startConnectivityWatchdog() {
+    if (connectivityTimerId) {
+        clearInterval(connectivityTimerId);
+    }
+
+    connectivityPing();
+    connectivityTimerId = setInterval(connectivityPing, WATCHDOG_INTERVAL_MS);
+}
+
+async function attemptSSEProbe() {
+    if (probeController) {
+        probeController.abort();
+    }
+
+    probeController = new AbortController();
+
+    return new Promise((resolve) => {
+        let resolved = false;
+        let probe;
+
+        const cleanup = (result) => {
+            if (resolved) {
+                return;
+            }
+
+            resolved = true;
+
+            probeController = null;
+
+            if (probe) {
+                try {
+                    probe.close();
+                } catch (error) {
+                    console.debug('Probe konnte nicht geschlossen werden:', error);
+                }
+            }
+
+            resolve(result);
+        };
+
+        try {
+            probe = new EventSource(buildSSEUrl());
+        } catch (error) {
+            console.debug('SSE-Probe konnte nicht erstellt werden:', error);
+            cleanup(false);
+            return;
+        }
+
+        const timeoutId = setTimeout(() => cleanup(false), 4000);
+
+        probe.onopen = () => {
+            clearTimeout(timeoutId);
+            cleanup(true);
+        };
+
+        probe.onerror = () => {
+            clearTimeout(timeoutId);
+            cleanup(false);
+        };
+
+        probeController.signal.addEventListener('abort', () => {
+            clearTimeout(timeoutId);
+            cleanup(false);
+        }, { once: true });
+    });
+}
+
+async function tryRecoverRealtime() {
+    if (!usePollingFallback) {
+        return;
+    }
+
+    const now = Date.now();
+    if (now - lastRecoveryAttemptAt < SSE_RECOVERY_INTERVAL_MS) {
+        return;
+    }
+
+    lastRecoveryAttemptAt = now;
+
+    const canRecover = await attemptSSEProbe();
+    if (!canRecover) {
+        return;
+    }
+
+    console.info('SSE-Verbindung wieder verfügbar – versuche Wechsel von Polling.');
+    startSSE({ force: true });
+}
+
+function processIncomingMessages(messages) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return;
+    }
+
+    let shouldRender = false;
+    const markReadFor = new Set();
+
+    messages.forEach(msg => {
+        const messageId = Number(msg.id);
+        if (Number.isFinite(messageId) && messageId > state.lastMessageId) {
+            state.lastMessageId = messageId;
+        }
+
+        const isRelevantChat = state.selectedUserId && (
+            (msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
+            (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId)
+        );
+
+        if (isRelevantChat) {
+            const alreadyExists = state.messages.some(existing => Number(existing.id) === messageId);
+
+            if (!alreadyExists) {
+                state.messages.push(msg);
+                shouldRender = true;
+
+                if (msg.to_user_id === state.currentUserId) {
+                    markReadFor.add(msg.from_user_id);
+                }
+            }
+        }
+    });
+
+    if (shouldRender) {
+        renderMessages();
+    }
+
+    markReadFor.forEach(userId => markAsRead(userId));
+
+    if (messages.length > 0) {
+        loadUsers();
+    }
+}
+
+function stopPollingUpdates() {
+    if (pollingTimerId) {
+        clearInterval(pollingTimerId);
+        pollingTimerId = null;
+    }
+}
+
+function startPollingUpdates() {
+    stopPollingUpdates();
+    pollMessages();
+    pollingTimerId = setInterval(pollMessages, POLLING_INTERVAL_MS);
+}
+
+async function pollMessages() {
+    if (isPollingUpdates) {
+        return;
+    }
+
+    isPollingUpdates = true;
+
+    const formData = new FormData();
+    formData.append('action', 'poll_updates');
+    formData.append('last_message_id', state.lastMessageId);
+
+    try {
+        const response = await postFormData(formData);
+        const result = await response.json();
+
+        if (result && result.success) {
+            const messages = Array.isArray(result.messages) ? result.messages : [];
+            if (typeof result.last_message_id === 'number') {
+                const newest = Number(result.last_message_id);
+                if (Number.isFinite(newest)) {
+                    state.lastMessageId = Math.max(state.lastMessageId, newest);
+                }
+            }
+            processIncomingMessages(messages);
+        }
+    } catch (error) {
+        console.warn('Polling fehlgeschlagen:', error);
+    } finally {
+        isPollingUpdates = false;
+    }
+}
+
+function enablePollingFallback() {
+    if (usePollingFallback) {
+        return;
+    }
+
+    usePollingFallback = true;
+
+    if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+    }
+
+    if (probeController) {
+        probeController.abort();
+        probeController = null;
+    }
+
+    if (!state.connectionErrorShown && state.selectedUserId && !state.isLoadingMessages) {
+        updateChatState('error', 'Live-Verbindung blockiert. Wechsel auf sichere Aktualisierung…');
+        state.connectionErrorShown = true;
+    }
+
+    startPollingUpdates();
+}
 
 async function loadUsers() {
     if (!userListEl) {
@@ -3025,7 +4345,7 @@ async function loadUsers() {
     renderUserList();
 
     try {
-        const response = await fetch('?action=get_users');
+        const response = await fetch(buildUrl({ action: 'get_users' }), { credentials: 'same-origin' });
         if (!response.ok) {
             throw new Error('NETZWERK_FEHLER');
         }
@@ -3034,6 +4354,10 @@ async function loadUsers() {
 
         if (result.success) {
             state.users = Array.isArray(result.users) ? result.users : [];
+            if (result.diagnostics) {
+                console.debug('Nutzerliste Diagnose', result.diagnostics);
+            }
+            console.debug('Nutzerliste geladen:', { count: state.users.length });
         } else {
             throw new Error(result.error || 'Nutzerliste konnte nicht geladen werden.');
         }
@@ -3043,9 +4367,42 @@ async function loadUsers() {
     } catch (error) {
         console.error('Nutzerliste konnte nicht geladen werden:', error);
         state.isLoadingUsers = false;
-        if (userListEl) {
-            userListEl.innerHTML = '<div class="error-state">Nutzerliste konnte nicht geladen werden.</div>';
+
+        const message = (error && error.message) ? error.message : 'Nutzerliste konnte nicht geladen werden.';
+        if (/nicht\s+eingeloggt/i.test(message) || /sitzung/i.test(message)) {
+            window.location.href = basePath;
+            return;
         }
+
+        if (userListEl) {
+            if (!Array.isArray(state.users) || state.users.length === 0) {
+                userListEl.innerHTML = '';
+                const errorBox = document.createElement('div');
+                errorBox.className = 'error-state user-list-error-banner';
+                errorBox.textContent = message;
+                userListEl.appendChild(errorBox);
+            } else {
+                const existingBanner = userListEl.querySelector('.user-list-error-banner');
+                if (existingBanner) {
+                    existingBanner.remove();
+                }
+                const banner = document.createElement('div');
+                banner.className = 'error-state user-list-error-banner';
+                banner.textContent = message;
+                userListEl.prepend(banner);
+                setTimeout(() => {
+                    if (banner.parentNode) {
+                        banner.remove();
+                    }
+                }, 5000);
+            }
+        }
+
+        setTimeout(() => {
+            if (!state.isLoadingUsers) {
+                loadUsers();
+            }
+        }, 5000);
     }
 }
 
@@ -3074,13 +4431,29 @@ function renderUserList() {
         return;
     }
 
+    const prioritizedUsers = filtered.slice();
+
+    if (state.selectedUserId && !prioritizedUsers.some(user => Number(user.id) === Number(state.selectedUserId))) {
+        const selectedUser = users.find(user => Number(user.id) === Number(state.selectedUserId));
+        if (selectedUser && selectedUser.display_name.toLowerCase().includes(searchTerm)) {
+            prioritizedUsers.push(selectedUser);
+        }
+    }
+
+    const seen = new Set();
     const fragment = document.createDocumentFragment();
 
-    filtered.forEach(user => {
+    prioritizedUsers.forEach(user => {
+        const userId = Number(user.id);
+        if (seen.has(userId)) {
+            return;
+        }
+        seen.add(userId);
+
         const item = document.createElement('button');
         item.type = 'button';
-        item.className = 'user-item' + (Number(user.id) === Number(state.selectedUserId) ? ' active' : '');
-        item.dataset.userId = String(user.id);
+        item.className = 'user-item' + (userId === Number(state.selectedUserId) ? ' active' : '');
+        item.dataset.userId = String(userId);
         item.dataset.displayName = user.display_name;
 
         const avatar = document.createElement('div');
@@ -3124,6 +4497,15 @@ function renderUserList() {
 
     userListEl.innerHTML = '';
     userListEl.appendChild(fragment);
+
+    if (offlineUsers.length > offlineLimit) {
+        const hint = document.createElement('div');
+        hint.className = 'user-status';
+        hint.style.textAlign = 'center';
+        hint.style.marginTop = '12px';
+        hint.textContent = 'Weitere Offline-Nutzer werden ausgeblendet.';
+        userListEl.appendChild(hint);
+    }
 }
 
 function renderChatHeader(displayName) {
@@ -3181,6 +4563,9 @@ function selectUser(userId, displayName) {
     state.selectedUserId = userId;
     state.messages = [];
 
+    clearAttachmentSelection();
+    clearAttachmentWarning();
+
     if (chatWelcomeEl) {
         chatWelcomeEl.style.display = 'none';
     }
@@ -3205,11 +4590,21 @@ async function loadMessages(userId) {
         return;
     }
 
+    if (messageAbortController) {
+        messageAbortController.abort();
+    }
+
+    const currentController = new AbortController();
+    messageAbortController = currentController;
+
     state.isLoadingMessages = true;
     updateChatState('loading', 'Nachrichten werden geladen…');
 
     try {
-        const response = await fetch(`?action=get_messages&user_id=${userId}`);
+        const response = await fetch(buildUrl({ action: 'get_messages', user_id: userId }), {
+            signal: currentController.signal,
+            credentials: 'same-origin'
+        });
         if (!response.ok) {
             throw new Error('NETZWERK_FEHLER');
         }
@@ -3234,6 +4629,9 @@ async function loadMessages(userId) {
             updateChatState('empty', 'Noch keine Nachrichten. Starte das Gespräch!');
         }
     } catch (error) {
+        if (error && error.name === 'AbortError') {
+            return;
+        }
         console.error('Nachrichten konnten nicht geladen werden:', error);
         state.messages = [];
         if (chatMessagesEl) {
@@ -3244,7 +4642,10 @@ async function loadMessages(userId) {
             : 'Nachrichten konnten nicht geladen werden. Bitte versuche es erneut.';
         updateChatState('error', errorMessage);
     } finally {
-        state.isLoadingMessages = false;
+        if (messageAbortController === currentController) {
+            messageAbortController = null;
+            state.isLoadingMessages = false;
+        }
     }
 }
 
@@ -3263,10 +4664,18 @@ function renderMessages() {
     container.innerHTML = state.messages.map(msg => {
         const isSent = msg.from_user_id === state.currentUserId;
         const time = new Date(msg.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+        const hasText = typeof msg.message === 'string' && msg.message.trim() !== '';
+        const attachmentUrl = msg.attachment_url;
+
+        const textHtml = hasText ? `<div class="message-text">${escapeHtml(msg.message)}</div>` : '';
+        const attachmentHtml = attachmentUrl
+            ? `<div class="message-attachment"><a href="${escapeAttribute(attachmentUrl)}" target="_blank" rel="noopener"><img src="${escapeAttribute(attachmentUrl)}" alt="Gesendetes Bild"></a></div>`
+            : '';
 
         return `
             <div class="message ${isSent ? 'message-sent' : 'message-received'}">
-                <div class="message-text">${escapeHtml(msg.message)}</div>
+                ${attachmentHtml}
+                ${textHtml}
                 <div class="message-time">${time}</div>
             </div>
         `;
@@ -3277,28 +4686,99 @@ function renderMessages() {
     updateChatState(null);
 }
 
+function clearAttachmentSelection() {
+    if (attachmentInputEl) {
+        attachmentInputEl.value = '';
+    }
+    if (attachmentInfoEl) {
+        attachmentInfoEl.classList.add('hidden');
+    }
+    if (attachmentFileNameEl) {
+        attachmentFileNameEl.textContent = '';
+    }
+}
+
+function showAttachmentWarning(message) {
+    if (attachmentWarningEl) {
+        attachmentWarningEl.textContent = message;
+        attachmentWarningEl.classList.remove('hidden');
+    } else {
+        alert(message);
+    }
+}
+
+function clearAttachmentWarning() {
+    if (attachmentWarningEl) {
+        attachmentWarningEl.textContent = '';
+        attachmentWarningEl.classList.add('hidden');
+    }
+}
+
 async function sendMessage() {
     if (!chatInputEl) {
         return;
     }
 
-    const message = chatInputEl.value.trim();
+    if (!state.selectedUserId) {
+        showAttachmentWarning('Bitte wähle zuerst einen Chat aus.');
+        return;
+    }
 
-    if (!message || !state.selectedUserId) return;
+    const message = chatInputEl.value.trim();
+    const attachmentFile = attachmentInputEl?.files?.[0] || null;
+
+    if (!message && !attachmentFile) {
+        showAttachmentWarning('Bitte gib eine Nachricht ein oder hänge ein JPG-Bild an.');
+        return;
+    }
+
+    clearAttachmentWarning();
+
+    if (attachmentFile) {
+        const fileType = (attachmentFile.type || '').toLowerCase();
+        const fileName = attachmentFile.name || '';
+        const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
+
+        if (!isJpeg) {
+            showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
+            clearAttachmentSelection();
+            return;
+        }
+
+        if (attachmentFile.size > ATTACHMENT_MAX_SIZE) {
+            showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
+            clearAttachmentSelection();
+            return;
+        }
+    }
 
     const formData = new FormData();
     formData.append('action', 'send_message');
     formData.append('to_user_id', state.selectedUserId);
     formData.append('message', message);
 
-    const response = await fetch('', { method: 'POST', body: formData });
-    const result = await response.json();
+    if (attachmentFile) {
+        formData.append('attachment', attachmentFile);
+    }
 
-    if (result.success) {
-        chatInputEl.value = '';
-        chatInputEl.dispatchEvent(new Event('input'));
-    } else {
-        alert(result.error);
+    try {
+        const response = await postFormData(formData);
+        const result = await response.json();
+
+        if (result.success) {
+            chatInputEl.value = '';
+            chatInputEl.dispatchEvent(new Event('input'));
+            clearAttachmentSelection();
+            clearAttachmentWarning();
+        } else {
+            if (result.error && /bild/i.test(result.error)) {
+                clearAttachmentSelection();
+            }
+            showAttachmentWarning(result.error || 'Nachricht konnte nicht gesendet werden.');
+        }
+    } catch (error) {
+        console.error('Nachricht konnte nicht gesendet werden:', error);
+        showAttachmentWarning('Nachricht konnte nicht gesendet werden.');
     }
 }
 
@@ -3307,20 +4787,48 @@ async function markAsRead(userId) {
     formData.append('action', 'mark_read');
     formData.append('user_id', userId);
 
-    await fetch('', { method: 'POST', body: formData });
+    await postFormData(formData);
     loadUsers();
 }
 
-function startSSE() {
-    if (state.eventSource) {
-        state.eventSource.close();
+function startSSE(options = {}) {
+    const force = options.force === true;
+
+    if (usePollingFallback && !force) {
+        startPollingUpdates();
+        return;
     }
 
-    const url = `?stream=events&last_message_id=${state.lastMessageId}&t=${Date.now()}`;
-    state.eventSource = new EventSource(url);
+    if (!usePollingFallback || !force) {
+        stopPollingUpdates();
+    }
+
+    if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+    }
+
+    const url = buildSSEUrl();
+
+    try {
+        state.eventSource = new EventSource(url);
+    } catch (error) {
+        console.warn('SSE kann nicht gestartet werden, wechsle auf Polling:', error);
+        enablePollingFallback();
+        return;
+    }
 
     state.eventSource.onopen = () => {
+        console.debug('SSE verbunden.');
+        sseErrorCount = 0;
         state.connectionErrorShown = false;
+        consecutivePingFailures = 0;
+
+        if (usePollingFallback) {
+            console.info('SSE erfolgreich wiederhergestellt.');
+            usePollingFallback = false;
+            stopPollingUpdates();
+        }
 
         if (!state.selectedUserId) {
             return;
@@ -3339,36 +4847,29 @@ function startSSE() {
 
     state.eventSource.onmessage = (event) => {
         state.connectionErrorShown = false;
-        const data = JSON.parse(event.data);
 
-        if (data.type === 'messages' && data.messages) {
-            data.messages.forEach(msg => {
-                const messageId = Number(msg.id);
+        if (!event.data) {
+            return;
+        }
 
-                if (messageId > state.lastMessageId) {
-                    state.lastMessageId = messageId;
-
-                    if (state.selectedUserId &&
-                        ((msg.from_user_id === state.selectedUserId && msg.to_user_id === state.currentUserId) ||
-                         (msg.from_user_id === state.currentUserId && msg.to_user_id === state.selectedUserId))) {
-
-                        if (!state.messages.find(m => Number(m.id) === messageId)) {
-                            state.messages.push(msg);
-                            renderMessages();
-
-                            if (msg.to_user_id === state.currentUserId) {
-                                markAsRead(msg.from_user_id);
-                            }
-                        }
-                    }
-                }
-            });
-
-            loadUsers();
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'messages') {
+                processIncomingMessages(Array.isArray(data.messages) ? data.messages : []);
+            }
+        } catch (error) {
+            console.warn('Konnte SSE-Daten nicht verarbeiten:', error);
         }
     };
 
     state.eventSource.onerror = () => {
+        if (state.eventSource) {
+            state.eventSource.close();
+            state.eventSource = null;
+        }
+
+        sseErrorCount += 1;
+
         if (!state.connectionErrorShown) {
             state.connectionErrorShown = true;
             console.warn('SSE-Verbindung unterbrochen, versuche Neuverbindung.');
@@ -3377,11 +4878,16 @@ function startSSE() {
             }
         }
 
-        if (state.eventSource) {
-            state.eventSource.close();
+        if (usePollingFallback || sseErrorCount >= 3) {
+            enablePollingFallback();
+            return;
         }
 
-        setTimeout(startSSE, 1500);
+        setTimeout(() => {
+            if (!usePollingFallback) {
+                startSSE();
+            }
+        }, 500);
     };
 }
 
@@ -3390,6 +4896,56 @@ function escapeHtml(text) {
     div.textContent = text ?? '';
     return div.innerHTML;
 }
+
+function escapeAttribute(value) {
+    const div = document.createElement('div');
+    div.textContent = value ?? '';
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+attachmentButtonEl?.addEventListener('click', () => {
+    attachmentInputEl?.click();
+});
+
+attachmentInputEl?.addEventListener('change', () => {
+    clearAttachmentWarning();
+
+    if (!attachmentInputEl.files || attachmentInputEl.files.length === 0) {
+        clearAttachmentSelection();
+        return;
+    }
+
+    const file = attachmentInputEl.files[0];
+    const fileType = (file.type || '').toLowerCase();
+    const fileName = file.name || '';
+    const isJpeg = /^image\/jpe?g$/.test(fileType) || /\.jpe?g$/i.test(fileName);
+
+    if (!isJpeg) {
+        showAttachmentWarning('Nur JPG-Bilder sind erlaubt.');
+        clearAttachmentSelection();
+        return;
+    }
+
+    if (file.size > ATTACHMENT_MAX_SIZE) {
+        showAttachmentWarning('Bild ist zu groß (max. 200 KB).');
+        clearAttachmentSelection();
+        return;
+    }
+
+    if (attachmentInfoEl) {
+        attachmentInfoEl.classList.remove('hidden');
+    }
+
+    if (attachmentFileNameEl) {
+        const sizeKb = Math.max(1, Math.round(file.size / 1024));
+        attachmentFileNameEl.textContent = `${file.name} (${sizeKb} KB)`;
+    }
+});
+
+attachmentClearBtnEl?.addEventListener('click', () => {
+    clearAttachmentSelection();
+    clearAttachmentWarning();
+});
 
 sendButtonEl?.addEventListener('click', sendMessage);
 
@@ -3405,8 +4961,21 @@ userSearchInput?.addEventListener('input', () => renderUserList());
 document.getElementById('logoutBtn')?.addEventListener('click', async () => {
     const formData = new FormData();
     formData.append('action', 'logout');
-    await fetch('', { method: 'POST', body: formData });
-    window.location.reload();
+
+    try {
+        const response = await postFormData(formData);
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            const result = await response.json().catch(() => null);
+            if (result && result.success === false) {
+                throw new Error(result.error || 'Logout fehlgeschlagen.');
+            }
+        }
+    } catch (error) {
+        console.error('Logout fehlgeschlagen:', error);
+    } finally {
+        window.location.href = basePath;
+    }
 });
 
 chatInputEl?.addEventListener('input', function() {
@@ -3414,15 +4983,20 @@ chatInputEl?.addEventListener('input', function() {
     this.style.height = Math.min(this.scrollHeight, 100) + 'px';
 });
 
-setInterval(async () => {
-    const formData = new FormData();
-    formData.append('action', 'ping');
-    await fetch('', { method: 'POST', body: formData });
-}, 10000);
-
 loadUsers();
 startSSE();
+attemptSSEProbe()
+    .then((canUse) => {
+        if (!canUse) {
+            console.info('SSE nicht verfügbar – wechsle auf Polling-Fallback.');
+            enablePollingFallback();
+        }
+    })
+    .catch(() => {
+        enablePollingFallback();
+    });
 setInterval(loadUsers, 30000);
+startConnectivityWatchdog();
 
 <?php endif; ?>
 </script>
