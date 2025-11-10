@@ -95,9 +95,6 @@ class LanguageManager
             'share' => 'Teilen',
             'pip' => 'Bild-in-Bild',
             'stats' => 'Stream-Status',
-            'starlink' => 'Starlink-Verbindung',
-            'starlink_caption' => 'Scanne den QR-Code für das Starlink Satelliteninternet.',
-            'starlink_alt' => 'Starlink QR-Code',
         ],
         'en' => [
             'title' => 'Aurora Weather Livecam',
@@ -127,9 +124,6 @@ class LanguageManager
             'share' => 'Share',
             'pip' => 'Picture-in-Picture',
             'stats' => 'Stream status',
-            'starlink' => 'Starlink Connection',
-            'starlink_caption' => 'Scan the QR code to reach Starlink satellite internet.',
-            'starlink_alt' => 'Starlink QR code',
         ],
         'fr' => [
             'title' => 'Aurora Weather Livecam',
@@ -159,9 +153,6 @@ class LanguageManager
             'share' => 'Partager',
             'pip' => 'Picture-in-Picture',
             'stats' => 'Statut du flux',
-            'starlink' => 'Connexion Starlink',
-            'starlink_caption' => 'Scannez le QR code pour accéder à l’internet satellite Starlink.',
-            'starlink_alt' => 'QR code Starlink',
         ],
         'it' => [
             'title' => 'Aurora Weather Livecam',
@@ -191,41 +182,6 @@ class LanguageManager
             'share' => 'Condividi',
             'pip' => 'Picture-in-Picture',
             'stats' => 'Stato del flusso',
-            'starlink' => 'Connessione Starlink',
-            'starlink_caption' => 'Scansiona il QR code per accedere a Starlink Internet satellitare.',
-            'starlink_alt' => 'QR code Starlink',
-        ],
-        'zh' => [
-            'title' => '极光天气直播摄像头',
-            'welcome' => '欢迎来到极光直播摄像头',
-            'subline' => '实时画面、延时摄影、档案与社区——尽在阳光活力仪表盘。',
-            'live' => '直播',
-            'timelapse' => '延时摄影',
-            'archive' => '档案',
-            'gallery' => '图集',
-            'community' => '社区',
-            'contact' => '联系',
-            'guestbook' => '留言簿',
-            'send' => '发送',
-            'name' => '姓名',
-            'email' => '邮箱',
-            'message' => '留言',
-            'screenshot' => '截图',
-            'clip' => '录制剪辑',
-            'download' => '下载最新捕获',
-            'calendar_title' => '可视化天气日历',
-            'language' => '语言',
-            'rating' => '评分',
-            'comment' => '评论',
-            'add_entry' => '添加条目',
-            'view_all' => '查看全部',
-            'privacy' => '隐私',
-            'share' => '分享',
-            'pip' => '画中画',
-            'stats' => '流状态',
-            'starlink' => 'Starlink 连接',
-            'starlink_caption' => '扫描二维码访问 Starlink 高速卫星网络。',
-            'starlink_alt' => 'Starlink 二维码',
         ],
     ];
 
@@ -266,9 +222,9 @@ class WebcamManager
 
     public function getImageFiles(): array
     {
-        $files = glob(IMAGE_DIR . '/screenshot_*.jpg') ?: [];
-        usort($files, static fn(string $a, string $b) => filemtime($b) <=> filemtime($a));
-        return array_slice($files, 0, 10);
+        $files = glob(IMAGE_DIR . '/screenshot_*.jpg');
+        rsort($files);
+        return $files;
     }
 
     public function getLatestVideo(): ?string
@@ -328,38 +284,32 @@ class WebcamManager
     public function getGallery(): array
     {
         $images = [];
-        foreach (glob(GALLERY_DIR . '/*.{jpg,jpeg,png,gif}', GLOB_BRACE) ?: [] as $file) {
-            $timestamp = filemtime($file) ?: 0;
+        foreach (glob(GALLERY_DIR . '/*.{jpg,jpeg,png,gif}', GLOB_BRACE) as $file) {
             $images[] = [
                 'src' => str_replace(__DIR__ . '/', '', $file),
-                'date' => date('Y-m-d H:i', $timestamp),
-                'timestamp' => $timestamp,
+                'date' => date('Y-m-d H:i', filemtime($file))
             ];
         }
-        usort($images, static fn(array $a, array $b) => $b['timestamp'] <=> $a['timestamp']);
-        $images = array_slice($images, 0, 10);
-        return array_map(static fn(array $image) => [
-            'src' => $image['src'],
-            'date' => $image['date'],
-        ], $images);
+        usort($images, static fn(array $a, array $b) => strcmp($b['date'], $a['date']));
+        return array_slice($images, 0, 20);
     }
 }
 
 class VisualCalendarManager
 {
     private array $monthNames = [
-        1 => ['de' => 'Januar', 'en' => 'January', 'it' => 'Gennaio', 'fr' => 'Janvier', 'zh' => '一月'],
-        2 => ['de' => 'Februar', 'en' => 'February', 'it' => 'Febbraio', 'fr' => 'Février', 'zh' => '二月'],
-        3 => ['de' => 'März', 'en' => 'March', 'it' => 'Marzo', 'fr' => 'Mars', 'zh' => '三月'],
-        4 => ['de' => 'April', 'en' => 'April', 'it' => 'Aprile', 'fr' => 'Avril', 'zh' => '四月'],
-        5 => ['de' => 'Mai', 'en' => 'May', 'it' => 'Maggio', 'fr' => 'Mai', 'zh' => '五月'],
-        6 => ['de' => 'Juni', 'en' => 'June', 'it' => 'Giugno', 'fr' => 'Juin', 'zh' => '六月'],
-        7 => ['de' => 'Juli', 'en' => 'July', 'it' => 'Luglio', 'fr' => 'Juillet', 'zh' => '七月'],
-        8 => ['de' => 'August', 'en' => 'August', 'it' => 'Agosto', 'fr' => 'Août', 'zh' => '八月'],
-        9 => ['de' => 'September', 'en' => 'September', 'it' => 'Settembre', 'fr' => 'Septembre', 'zh' => '九月'],
-        10 => ['de' => 'Oktober', 'en' => 'October', 'it' => 'Ottobre', 'fr' => 'Octobre', 'zh' => '十月'],
-        11 => ['de' => 'November', 'en' => 'November', 'it' => 'Novembre', 'fr' => 'Novembre', 'zh' => '十一月'],
-        12 => ['de' => 'Dezember', 'en' => 'December', 'it' => 'Dicembre', 'fr' => 'Décembre', 'zh' => '十二月'],
+        1 => ['de' => 'Januar', 'en' => 'January', 'it' => 'Gennaio', 'fr' => 'Janvier'],
+        2 => ['de' => 'Februar', 'en' => 'February', 'it' => 'Febbraio', 'fr' => 'Février'],
+        3 => ['de' => 'März', 'en' => 'March', 'it' => 'Marzo', 'fr' => 'Mars'],
+        4 => ['de' => 'April', 'en' => 'April', 'it' => 'Aprile', 'fr' => 'Avril'],
+        5 => ['de' => 'Mai', 'en' => 'May', 'it' => 'Maggio', 'fr' => 'Mai'],
+        6 => ['de' => 'Juni', 'en' => 'June', 'it' => 'Giugno', 'fr' => 'Juin'],
+        7 => ['de' => 'Juli', 'en' => 'July', 'it' => 'Luglio', 'fr' => 'Juillet'],
+        8 => ['de' => 'August', 'en' => 'August', 'it' => 'Agosto', 'fr' => 'Août'],
+        9 => ['de' => 'September', 'en' => 'September', 'it' => 'Settembre', 'fr' => 'Septembre'],
+        10 => ['de' => 'Oktober', 'en' => 'October', 'it' => 'Ottobre', 'fr' => 'Octobre'],
+        11 => ['de' => 'November', 'en' => 'November', 'it' => 'Novembre', 'fr' => 'Novembre'],
+        12 => ['de' => 'Dezember', 'en' => 'December', 'it' => 'Dicembre', 'fr' => 'Décembre'],
     ];
 
     public function getMonthData(int $year, int $month): array
@@ -743,27 +693,6 @@ $translations = $languageManager->getAllTranslations();
             justify-content: space-between;
         }
 
-        .qr-wrapper {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .qr-wrapper img {
-            width: 160px;
-            height: 160px;
-            border-radius: 12px;
-            box-shadow: 0 12px 24px rgba(0,0,0,0.12);
-            background: white;
-            padding: 6px;
-        }
-
-        .qr-wrapper small {
-            text-align: center;
-            color: rgba(0,0,0,0.6);
-        }
-
         .badge {
             display: inline-flex;
             align-items: center;
@@ -938,15 +867,6 @@ $translations = $languageManager->getAllTranslations();
             <div class="meta-card">
                 <h3><?= htmlspecialchars($languageManager->get('gallery', $locale)) ?></h3>
                 <div class="media-grid" id="imageGrid"></div>
-            </div>
-            <div class="meta-card">
-                <h3><?= htmlspecialchars($languageManager->get('starlink', $locale)) ?></h3>
-                <div class="qr-wrapper">
-                    <a href="https://www.starlink.com/" target="_blank" rel="noopener noreferrer">
-                        <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data=https%3A%2F%2Fwww.starlink.com%2F" alt="<?= htmlspecialchars($languageManager->get('starlink_alt', $locale)) ?>">
-                    </a>
-                    <small><?= htmlspecialchars($languageManager->get('starlink_caption', $locale)) ?></small>
-                </div>
             </div>
         </div>
     </section>
