@@ -5,18 +5,46 @@ $error = '';
 $rawOutput = '';
 
 if ($host !== '') {
-    $sanitizedHost = preg_replace('/[^A-Za-z0-9\-\.:]/', '', $host);
-    if ($sanitizedHost === '') {
+    // Erweiterte Validierung für IPv4, IPv6 und Hostnamen
+    $sanitizedHost = trim($host);
+
+    // Prüfe ob es eine gültige IP oder Hostname ist
+    $isValidIPv4 = filter_var($sanitizedHost, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4);
+    $isValidIPv6 = filter_var($sanitizedHost, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6);
+    $isValidHostname = preg_match('/^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$/', $sanitizedHost);
+
+    if (!$isValidIPv4 && !$isValidIPv6 && !$isValidHostname) {
         $error = 'Bitte geben Sie einen gültigen Hostnamen oder eine IP-Adresse ein.';
     } else {
-        $command = 'traceroute -n ' . escapeshellarg($sanitizedHost) . ' 2>&1';
-        $rawOutput = shell_exec($command);
-        if ($rawOutput === null) {
-            $error = 'Traceroute konnte nicht ausgeführt werden. Ist das Kommando verfügbar?';
-        } else {
-            $traceData = parseTraceroute($rawOutput);
-            if (empty($traceData)) {
-                $error = 'Keine Hops gefunden. Prüfen Sie den Hostnamen oder versuchen Sie es später erneut.';
+        // Prüfe ob traceroute verfügbar ist
+        $tracerouteCmd = $isValidIPv6 ? 'traceroute6' : 'traceroute';
+        $checkCmd = 'command -v ' . $tracerouteCmd . ' > /dev/null 2>&1';
+        exec($checkCmd, $output, $returnCode);
+
+        if ($returnCode !== 0) {
+            // Fallback zu traceroute wenn traceroute6 nicht verfügbar
+            if ($isValidIPv6) {
+                $tracerouteCmd = 'traceroute';
+                exec('command -v traceroute > /dev/null 2>&1', $output, $returnCode);
+            }
+
+            if ($returnCode !== 0) {
+                $error = 'Traceroute ist auf diesem System nicht verfügbar.';
+            }
+        }
+
+        if ($error === '') {
+            // Führe traceroute mit Timeout aus (max 30 Sekunden)
+            $command = 'timeout 30 ' . $tracerouteCmd . ' -n -m 20 -w 2 ' . escapeshellarg($sanitizedHost) . ' 2>&1';
+            $rawOutput = shell_exec($command);
+
+            if ($rawOutput === null || trim($rawOutput) === '') {
+                $error = 'Traceroute konnte nicht ausgeführt werden oder lieferte keine Ausgabe.';
+            } else {
+                $traceData = parseTraceroute($rawOutput);
+                if (empty($traceData)) {
+                    $error = 'Keine Hops gefunden. Prüfen Sie den Hostnamen oder versuchen Sie es später erneut.';
+                }
             }
         }
     }
@@ -38,21 +66,37 @@ function parseTraceroute(string $raw): array
 
     $hops = [];
     foreach ($lines as $line) {
-        if (preg_match('/^\s*\d+\s+/', $line) !== 1) {
+        // Überspringe Header-Zeilen und leere Zeilen
+        if (!preg_match('/^\s*\d+\s+/', $line)) {
             continue;
         }
 
-        preg_match_all('/(\d+\.\d+)\s+ms/', $line, $latencyMatches);
+        // Extrahiere die Hop-Nummer
+        if (!preg_match('/^\s*(\d+)\s+/', $line, $hopMatch)) {
+            continue;
+        }
+        $hopNumber = (int) $hopMatch[1];
+
+        // Extrahiere Latenz-Werte (unterstützt verschiedene Formate)
+        preg_match_all('/(\d+(?:\.\d+)?)\s*ms/', $line, $latencyMatches);
         $latencies = array_map('floatval', $latencyMatches[1] ?? []);
-        $avgLatency = !empty($latencies) ? array_sum($latencies) / count($latencies) : null;
+        $avgLatency = !empty($latencies) ? round(array_sum($latencies) / count($latencies), 2) : null;
 
-        if (preg_match('/^\s*(\d+)\s+([0-9\.\*]+)/', $line, $parts) !== 1) {
-            continue;
+        // Extrahiere IP-Adresse (IPv4, IPv6 oder *)
+        // Pattern für IPv4: xxx.xxx.xxx.xxx
+        // Pattern für IPv6: xxxx:xxxx:... oder komprimiert ::
+        $ip = 'Zeitüberschreitung';
+
+        // Versuche IPv4 zu finden
+        if (preg_match('/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/', $line, $ipMatch)) {
+            $ip = $ipMatch[1];
         }
-
-        $hopNumber = (int) $parts[1];
-        $ip = $parts[2];
-        if ($ip === '*') {
+        // Versuche IPv6 zu finden (verschiedene Formate)
+        elseif (preg_match('/([0-9a-fA-F]{1,4}:+[0-9a-fA-F:]+)/', $line, $ipMatch)) {
+            $ip = $ipMatch[1];
+        }
+        // Prüfe auf * (Timeout)
+        elseif (preg_match('/\s+\*\s+/', $line)) {
             $ip = 'Zeitüberschreitung';
         }
 

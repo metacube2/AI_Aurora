@@ -5,18 +5,46 @@ $error = '';
 $rawOutput = '';
 
 if ($host !== '') {
-    $sanitizedHost = preg_replace('/[^A-Za-z0-9\-\.:]/', '', $host);
-    if ($sanitizedHost === '') {
+    // Erweiterte Validierung für IPv4, IPv6 und Hostnamen
+    $sanitizedHost = trim($host);
+
+    // Prüfe ob es eine gültige IP oder Hostname ist
+    $isValidIPv4 = filter_var($sanitizedHost, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4);
+    $isValidIPv6 = filter_var($sanitizedHost, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6);
+    $isValidHostname = preg_match('/^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$/', $sanitizedHost);
+
+    if (!$isValidIPv4 && !$isValidIPv6 && !$isValidHostname) {
         $error = 'Bitte geben Sie einen gültigen Hostnamen oder eine IP-Adresse ein.';
     } else {
-        $command = 'traceroute -n ' . escapeshellarg($sanitizedHost) . ' 2>&1';
-        $rawOutput = shell_exec($command);
-        if ($rawOutput === null) {
-            $error = 'Traceroute konnte nicht ausgeführt werden. Ist das Kommando verfügbar?';
-        } else {
-            $traceData = parseTraceroute($rawOutput);
-            if (empty($traceData)) {
-                $error = 'Keine Hops gefunden. Prüfen Sie den Hostnamen oder versuchen Sie es später erneut.';
+        // Prüfe ob traceroute verfügbar ist
+        $tracerouteCmd = $isValidIPv6 ? 'traceroute6' : 'traceroute';
+        $checkCmd = 'command -v ' . $tracerouteCmd . ' > /dev/null 2>&1';
+        exec($checkCmd, $output, $returnCode);
+
+        if ($returnCode !== 0) {
+            // Fallback zu traceroute wenn traceroute6 nicht verfügbar
+            if ($isValidIPv6) {
+                $tracerouteCmd = 'traceroute';
+                exec('command -v traceroute > /dev/null 2>&1', $output, $returnCode);
+            }
+
+            if ($returnCode !== 0) {
+                $error = 'Traceroute ist auf diesem System nicht verfügbar.';
+            }
+        }
+
+        if ($error === '') {
+            // Führe traceroute mit Timeout aus (max 30 Sekunden)
+            $command = 'timeout 30 ' . $tracerouteCmd . ' -n -m 20 -w 2 ' . escapeshellarg($sanitizedHost) . ' 2>&1';
+            $rawOutput = shell_exec($command);
+
+            if ($rawOutput === null || trim($rawOutput) === '') {
+                $error = 'Traceroute konnte nicht ausgeführt werden oder lieferte keine Ausgabe.';
+            } else {
+                $traceData = parseTraceroute($rawOutput);
+                if (empty($traceData)) {
+                    $error = 'Keine Hops gefunden. Prüfen Sie den Hostnamen oder versuchen Sie es später erneut.';
+                }
             }
         }
     }
@@ -45,20 +73,37 @@ function parseTraceroute(string $raw): array
 
     $hops = [];
     foreach ($lines as $line) {
-        if (!preg_match('/^\s*(\d+)\s+(.+)/', $line, $parts)) {
+        // Überspringe Header-Zeilen und leere Zeilen
+        if (!preg_match('/^\s*\d+\s+/', $line)) {
             continue;
         }
 
-        $hopNumber = (int) $parts[1];
-        $rest = $parts[2];
+        // Extrahiere die Hop-Nummer
+        if (!preg_match('/^\s*(\d+)\s+/', $line, $hopMatch)) {
+            continue;
+        }
+        $hopNumber = (int) $hopMatch[1];
 
-        preg_match('/([0-9a-fA-F:\.\-]+|\*)/', $rest, $ipMatch);
-        $ip = $ipMatch[1] ?? '*';
-        $ip = $ip === '*' ? 'Zeitüberschreitung' : $ip;
-
-        preg_match_all('/(\d+\.\d+)\s+ms/', $rest, $latencyMatches);
+        // Extrahiere Latenz-Werte (unterstützt verschiedene Formate)
+        preg_match_all('/(\d+(?:\.\d+)?)\s*ms/', $line, $latencyMatches);
         $latencies = array_map('floatval', $latencyMatches[1] ?? []);
         $avgLatency = !empty($latencies) ? round(array_sum($latencies) / count($latencies), 2) : null;
+
+        // Extrahiere IP-Adresse (IPv4, IPv6 oder *)
+        $ip = 'Zeitüberschreitung';
+
+        // Versuche IPv4 zu finden
+        if (preg_match('/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/', $line, $ipMatch)) {
+            $ip = $ipMatch[1];
+        }
+        // Versuche IPv6 zu finden (verschiedene Formate)
+        elseif (preg_match('/([0-9a-fA-F]{1,4}:+[0-9a-fA-F:]+)/', $line, $ipMatch)) {
+            $ip = $ipMatch[1];
+        }
+        // Prüfe auf * (Timeout)
+        elseif (preg_match('/\s+\*\s+/', $line)) {
+            $ip = 'Zeitüberschreitung';
+        }
 
         $hops[] = [
             'hop' => $hopNumber,
@@ -542,7 +587,29 @@ function generateGalaxyLayout(int $count): array
     const starField = new THREE.Points(starGeometry, starMaterial);
     scene.add(starField);
 
-    const glowTexture = new THREE.TextureLoader().load('https://cdn.jsdelivr.net/gh/ykob/sketch-threejs@master/example/img/glow.png');
+    // Lade Glow Texture mit Fehlerbehandlung
+    const textureLoader = new THREE.TextureLoader();
+    let glowTexture = null;
+
+    textureLoader.load(
+        'https://cdn.jsdelivr.net/gh/ykob/sketch-threejs@master/example/img/glow.png',
+        (texture) => {
+            glowTexture = texture;
+            // Aktualisiere Sprites mit geladenem Texture
+            hopMeshes.forEach(mesh => {
+                const sprite = mesh.children.find(child => child instanceof THREE.Sprite);
+                if (sprite && sprite.material) {
+                    sprite.material.map = glowTexture;
+                    sprite.material.needsUpdate = true;
+                }
+            });
+        },
+        undefined,
+        (error) => {
+            console.warn('Konnte Glow-Texture nicht laden, verwende Fallback:', error);
+            // Fallback: Verwende einfache Farbe ohne Texture
+        }
+    );
 
     const hopPositions = rawTrace.map(hop => new THREE.Vector3(hop.position.x, hop.position.y, hop.position.z));
     routeCurve = new THREE.CatmullRomCurve3(hopPositions, false, 'catmullrom', 0.1);
@@ -585,7 +652,8 @@ function generateGalaxyLayout(int $count): array
     const hopGeometry = new THREE.SphereGeometry(3.2, 32, 32);
     const hopMaterial = new THREE.MeshStandardMaterial({ color: 0x38bdf8, emissive: 0x164e63, metalness: 0.5, roughness: 0.35 });
 
-    const spriteMaterial = new THREE.SpriteMaterial({ map: glowTexture, color: 0x38bdf8, transparent: true, opacity: 0.6, depthWrite: false });
+    // Sprite-Material ohne Texture erstellen (wird später aktualisiert wenn Texture geladen ist)
+    const spriteMaterial = new THREE.SpriteMaterial({ map: null, color: 0x38bdf8, transparent: true, opacity: 0.6, depthWrite: false });
 
     rawTrace.forEach((hop, index) => {
         const mesh = new THREE.Mesh(hopGeometry, hopMaterial.clone());
