@@ -2793,7 +2793,18 @@ body.theme-neo footer {
     transform: scale(1.05);
 }
 
+.twint-box {
+    display: flex;
+    justify-content: center;
+    margin-top: 20px;
+}
 
+.twint-image {
+    max-width: 280px;
+    width: 100%;
+    height: auto;
+    border-radius: 8px;
+}
 
 </style>
 
@@ -3112,6 +3123,11 @@ body.theme-neo footer {
         <p data-en="Click QR code to copy URL" data-de="Klicke auf den QR-Code um die URL zu kopieren" data-it="Fai clic sul codice QR per copiare l'URL" data-fr="Cliquez sur le code QR pour copier l'URL" data-zh="点击二维码复制网址">
             Klicke auf den QR-Code, um die URL zu kopieren
         </p>
+
+
+        <div class="twint-box">
+    <img src="twint.jpg" alt="TWINT" class="twint-image">
+</div>
     </div>
 </section>
 
