@@ -2746,6 +2746,55 @@ body.theme-neo footer {
 }
 
 
+
+
+
+.starlink-banner-wrapper {
+    text-align: center;
+    margin: 30px 0 20px 0;
+}
+
+.starlink-banner {
+    max-width: 700px;
+    margin: 0 auto;
+    padding: 20px;
+    background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+    border-radius: 12px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+}
+
+.starlink-banner h3 {
+    color: white;
+    margin: 0 0 15px 0;
+}
+
+.starlink-banner p {
+    color: white;
+    margin: 0 0 15px 0;
+    line-height: 1.6;
+}
+
+.starlink-banner a {
+    display: inline-block;
+}
+
+.starlink-banner img {
+    max-width: 220px;
+    width: 100%;
+    height: auto;
+    border-radius: 8px;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.3);
+    background: white;
+    padding: 6px;
+    transition: transform 0.3s;
+}
+
+.starlink-banner img:hover {
+    transform: scale(1.05);
+}
+
+
+
 </style>
 
     <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
@@ -2992,6 +3041,9 @@ body.theme-neo footer {
     </div>
 </section>
 
+
+
+
 <div style="text-align: center; margin-bottom: 20px;">
     <div style="display: flex; justify-content: center;">
         <a href="https://buymeacoffee.com/auroracam" target="_blank" rel="noopener">
@@ -3002,6 +3054,21 @@ body.theme-neo footer {
         Gefällt dir die Livecam? Unterstütze das Projekt –<br>jeder Franken zählt und hilft die Betriebskosten<br>zu decken. So kannst du auch weiterhin<br>Fotos und Videos kostenlos nutzen.
     </p>
 </div>
+
+<div class="starlink-banner-wrapper">
+    <div class="starlink-banner">
+        <h3>🛰️ Schnelles Internet für Ihre Livestreams</h3>
+        <p>
+            Für hochwertige Webcam-Übertragungen empfehlen wir Starlink –
+            Highspeed-Internet überall verfügbar, perfekt für abgelegene Standorte!
+        </p>
+        <a href="https://www.starlink.com/" target="_blank" rel="noopener noreferrer">
+            <img src="starlink.png" alt="Starlink - Schnelles Internet überall">
+        </a>
+    </div>
+</div>
+
+
 <!-- ARCHIVE SECTION -->
 <section id="archive" class="section">
     <div class="container">
