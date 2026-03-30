@@ -3138,7 +3138,16 @@ body.theme-neo footer {
     </div>
 </section>
 
-
+<div style="text-align: center; margin-bottom: 20px;">
+    <div style="display: flex; justify-content: center;">
+        <a href="https://buymeacoffee.com/auroracam" target="_blank" rel="noopener">
+            <img src="buy.png" alt="Buy me a coffee" style="height: 267px; border-radius: 8px; transition: transform 0.2s;" onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+        </a>
+    </div>
+    <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 8px 16px; border-radius: 8px; margin: 10px auto 0; max-width: 400px; line-height: 1.6;">
+        Gefällt dir die Livecam? Unterstütze das Projekt –<br>jeder Franken zählt und hilft die Betriebskosten<br>zu decken. So kannst du auch weiterhin<br>Fotos und Videos kostenlos nutzen.
+    </p>
+</div>
 
 
 <div class="twint-box">
