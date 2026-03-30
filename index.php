@@ -3142,7 +3142,18 @@ body.theme-neo footer {
 
 
 <div class="twint-box">
-    <img src="twint.jpg" alt="TWINT" class="twint-image">
+    <img src="twint1.jpg" alt="TWINT" class="twint-image">
+
+
+<p
+   data-de="Unterstütze die Aurora Livecam mit deiner Spende. Du hilfst dabei, Kamera, Server, Starlink-Verbindung und die 100 % autarke Stromversorgung mit Solarenergie und EcoFlow-Speichern zu finanzieren. So bleibt das Projekt nachhaltig, unabhängig und für alle frei zugänglich."
+   data-en="Support the Aurora livecam with your donation. You help fund the camera, server, Starlink connection, and the 100% off-grid power system based on solar energy and EcoFlow storage. This keeps the project sustainable, independent, and freely accessible to everyone."
+   data-fr="Soutenez la webcam Aurora par votre don. Vous contribuez au financement de la caméra, du serveur, de la connexion Starlink et du système d'alimentation 100 % autonome basé sur l'énergie solaire et le stockage EcoFlow. Cela permet au projet de rester durable, indépendant et accessible à tous."
+   data-it="Sostieni la livecam Aurora con la tua donazione. Aiuti a finanziare la telecamera, il server, la connessione Starlink e il sistema di alimentazione 100% autonomo basato su energia solare e accumulo EcoFlow. Così il progetto resta sostenibile, indipendente e accessibile a tutti."
+   data-zh="通过捐助支持 Aurora 实时摄像头。您的支持将帮助承担摄像头、服务器、Starlink 连接，以及基于太阳能和 EcoFlow 储能的 100% 自给供电系统成本，让项目保持可持续、独立并持续免费开放。"
+   style="font-size: 14px; color: #333; background: rgba(255,255,255,0.92); padding: 14px 18px; border-radius: 10px; margin: 12px auto 0; max-width: 640px; line-height: 1.7;">
+    Unterstütze die Aurora Livecam mit deiner Spende. Du hilfst dabei, Kamera, Server, Starlink-Verbindung und die 100 % autarke Stromversorgung mit Solarenergie und EcoFlow-Speichern zu finanzieren. So bleibt das Projekt nachhaltig, unabhängig und für alle frei zugänglich.
+</p>
 
     <span class="green-label-badge">
         🌱 724 Green Label Swiss
