@@ -2795,15 +2795,18 @@ body.theme-neo footer {
 
 .twint-box {
     display: flex;
-    justify-content: center;
-    margin-top: 20px;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 12px;
+    margin: 30px auto 20px auto;
 }
 
 .twint-image {
-    max-width: 280px;
+    max-width: 320px;
     width: 100%;
     height: auto;
-    border-radius: 8px;
+    display: block;
 }
 
 </style>
@@ -3055,18 +3058,29 @@ body.theme-neo footer {
 
 
 
- <div class="twint-box">
+<div class="twint-box">
     <img src="twint.jpg" alt="TWINT" class="twint-image">
 
-    <div style="text-align:center; margin-top: 12px;">
-        <span style="display:inline-block; background:#2e7d32; color:white; font-size:12px; font-weight:bold; padding:6px 12px; border-radius:20px; margin-bottom:10px;">
-            🌱 Mit Solarstrom betrieben
-        </span>
+    <span style="display:inline-block; background:#2e7d32; color:white; font-size:12px; font-weight:bold; padding:6px 12px; border-radius:20px;">
+        🌱 Mit Solarstrom betrieben
+    </span>
 
-        <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 12px 16px; border-radius: 8px; margin: 10px auto 0; max-width: 460px; line-height: 1.7;">
-            Unterstütze die Livecam – Server und Kamera laufen mit <strong>Starlink</strong> und <strong>Solarstrom</strong>.<br>
-            Jeder Beitrag hilft, die Betriebskosten zu decken und das Projekt langfristig am Laufen zu halten.
+    <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 12px 16px; border-radius: 8px; margin: 0 auto; max-width: 460px; line-height: 1.7;">
+        Unterstütze die Livecam – Server und Kamera laufen mit <strong>Starlink</strong> und <strong>Solarstrom</strong>.<br>
+        Jeder Beitrag hilft, die Betriebskosten zu decken und das Projekt langfristig am Laufen zu halten.
+    </p>
+</div>
+
+<div class="starlink-banner-wrapper">
+    <div class="starlink-banner">
+        <h3>🛰️ Schnelles Internet für Ihre Livestreams</h3>
+        <p>
+            Für hochwertige Webcam-Übertragungen empfehlen wir Starlink –
+            Highspeed-Internet überall verfügbar, perfekt für abgelegene Standorte!
         </p>
+        <a href="https://www.starlink.com/" target="_blank" rel="noopener noreferrer">
+            <img src="starlink.png" alt="Starlink - Schnelles Internet überall">
+        </a>
     </div>
 </div>
 
