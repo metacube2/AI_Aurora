@@ -2798,8 +2798,9 @@ body.theme-neo footer {
     flex-direction: column;
     align-items: center;
     text-align: center;
-    gap: 12px;
+    gap: 14px;
     margin: 30px auto 20px auto;
+    max-width: 760px;
 }
 
 .twint-image {
@@ -2807,6 +2808,88 @@ body.theme-neo footer {
     width: 100%;
     height: auto;
     display: block;
+    border-radius: 10px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+}
+
+.green-label-badge {
+    display: inline-block;
+    background: linear-gradient(135deg, #2e7d32, #43a047);
+    color: white;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 7px 14px;
+    border-radius: 20px;
+    letter-spacing: 0.3px;
+    box-shadow: 0 4px 10px rgba(46,125,50,0.25);
+}
+
+.eco-business-box {
+    background: rgba(255,255,255,0.92);
+    border-radius: 14px;
+    padding: 22px 24px;
+    max-width: 700px;
+    width: 100%;
+    box-shadow: 0 10px 24px rgba(0,0,0,0.10);
+    border: 1px solid rgba(46,125,50,0.15);
+}
+
+.eco-business-box h3 {
+    margin: 0 0 8px 0;
+    font-size: 24px;
+    color: #1b5e20;
+    line-height: 1.3;
+}
+
+.eco-subtitle {
+    margin: 0 0 16px 0;
+    font-size: 16px;
+    font-weight: bold;
+    color: #2e7d32;
+}
+
+.eco-business-box p {
+    font-size: 15px;
+    color: #333;
+    line-height: 1.7;
+    margin-bottom: 18px;
+}
+
+.eco-feature-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    gap: 10px;
+}
+
+.eco-feature-list li {
+    background: #f4faf4;
+    border-left: 4px solid #43a047;
+    padding: 12px 14px;
+    border-radius: 8px;
+    font-size: 14px;
+    color: #2d2d2d;
+    text-align: left;
+    line-height: 1.5;
+}
+
+@media (max-width: 768px) {
+    .eco-business-box {
+        padding: 18px 16px;
+    }
+
+    .eco-business-box h3 {
+        font-size: 20px;
+    }
+
+    .eco-subtitle {
+        font-size: 15px;
+    }
+
+    .eco-feature-list li {
+        font-size: 13px;
+    }
 }
 
 </style>
@@ -3061,26 +3144,66 @@ body.theme-neo footer {
 <div class="twint-box">
     <img src="twint.jpg" alt="TWINT" class="twint-image">
 
-    <span style="display:inline-block; background:#2e7d32; color:white; font-size:12px; font-weight:bold; padding:6px 12px; border-radius:20px;">
-        🌱 Mit Solarstrom betrieben
+    <span class="green-label-badge">
+        🌱 724 Green Label Swiss
     </span>
 
-    <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 12px 16px; border-radius: 8px; margin: 0 auto; max-width: 460px; line-height: 1.7;">
-        Unterstütze die Livecam – Server und Kamera laufen mit <strong>Starlink</strong> und <strong>Solarstrom</strong>.<br>
-        Jeder Beitrag hilft, die Betriebskosten zu decken und das Projekt langfristig am Laufen zu halten.
-    </p>
-</div>
+    <div class="eco-business-box">
+        <h3
+            data-de="Live & 100% autark: Unsere Aurora-Webcam"
+            data-en="Live & 100% Off-Grid: Our Aurora Webcam"
+            data-fr="Live & 100% autonome : Notre Webcam Aurora"
+            data-it="Live & 100% autonoma: La nostra Webcam Aurora"
+            data-zh="实时在线 & 100% 能源自给：Aurora 实时摄像头">
+            Live & 100% autark: Unsere Aurora-Webcam
+        </h3>
 
-<div class="starlink-banner-wrapper">
-    <div class="starlink-banner">
-        <h3>🛰️ Schnelles Internet für Ihre Livestreams</h3>
-        <p>
-            Für hochwertige Webcam-Übertragungen empfehlen wir Starlink –
-            Highspeed-Internet überall verfügbar, perfekt für abgelegene Standorte!
+        <p class="eco-subtitle"
+           data-de="Powered by EcoFlow & Swiss Sun"
+           data-en="Powered by EcoFlow & Swiss Sun"
+           data-fr="Propulsée par EcoFlow & le Soleil Suisse"
+           data-it="Alimentata da EcoFlow & Sole Svizzero"
+           data-zh="由 EcoFlow 与瑞士阳光驱动">
+            Powered by EcoFlow & Swiss Sun
         </p>
-        <a href="https://www.starlink.com/" target="_blank" rel="noopener noreferrer">
-            <img src="starlink.png" alt="Starlink - Schnelles Internet überall">
-        </a>
+
+        <p
+            data-de="Erleben Sie Dürnten in Echtzeit – angetrieben durch die reine Kraft der Natur. Unsere Infrastruktur wird zu 100 % mit Solarstrom und EcoFlow-Batteriespeichern betrieben."
+            data-en="Experience Dürnten in real-time – powered by the pure force of nature. Our infrastructure runs 100% on solar power and EcoFlow battery storage."
+            data-fr="Découvrez Dürnten en temps réel, propulsé par l'énergie pure de la nature. Notre infrastructure fonctionne à 100 % à l'énergie solaire avec le stockage par batterie EcoFlow."
+            data-it="Scoprite Dürnten in tempo reale, alimentata dalla pura forza della natura. La nostra infrastruttura è gestita al 100 % con energia solare e sistemi di accumulo EcoFlow."
+            data-zh="实时感受迪恩滕（Dürnten）—— 由纯净自然能量驱动。我们的基础设施 100% 采用太阳能和 EcoFlow 电池储能系统。">
+            Erleben Sie Dürnten in Echtzeit – angetrieben durch die reine Kraft der Natur. Unsere Infrastruktur wird zu 100 % mit Solarstrom und EcoFlow-Batteriespeichern betrieben.
+        </p>
+
+        <ul class="eco-feature-list">
+            <li
+                data-de="724 Green Label Swiss: Zertifizierte Nachhaltigkeit."
+                data-en="724 Green Label Swiss: Certified sustainability."
+                data-fr="724 Green Label Swiss : Durabilité certifiée."
+                data-it="724 Green Label Swiss: Sostenibilità certificata."
+                data-zh="724 Green Label Swiss：认证的可持续发展。">
+                724 Green Label Swiss: Zertifizierte Nachhaltigkeit.
+            </li>
+
+            <li
+                data-de="24/7 Green Power: Dank modernster Speichertechnologie."
+                data-en="24/7 Green Energy: Thanks to state-of-the-art storage technology."
+                data-fr="Énergie Verte 24/7 : Grâce à une technologie de stockage de pointe."
+                data-it="Energia Verde 24/7: Grazie a una tecnologia di accumulo all'avanguardia."
+                data-zh="24/7 绿色能源：得益于尖端的储能技术。">
+                24/7 Green Power: Dank modernster Speichertechnologie.
+            </li>
+
+            <li
+                data-de="Emissionsfrei: Innovation direkt aus dem Herzen der Schweiz."
+                data-en="Zero Emissions: Innovation straight from the heart of Switzerland."
+                data-fr="Zéro Émission : L'innovation au cœur de la Suisse."
+                data-it="Zero Emissioni: Innovazione direttamente dal cuore della Svizzera."
+                data-zh="零排放：源自瑞士心脏地带的创新。">
+                Emissionsfrei: Innovation direkt aus dem Herzen der Schweiz.
+            </li>
+        </ul>
     </div>
 </div>
 
@@ -3096,6 +3219,7 @@ body.theme-neo footer {
         </a>
     </div>
 </div>
+ 
 
 
 <!-- ARCHIVE SECTION -->
