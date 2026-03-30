@@ -3055,18 +3055,19 @@ body.theme-neo footer {
 
 
 
- 
-  <div class="twint-box">
+ <div class="twint-box">
     <img src="twint.jpg" alt="TWINT" class="twint-image">
-<div style="text-align:center; margin-top: 12px;">
-    <span style="display:inline-block; background:#2e7d32; color:white; font-size:12px; font-weight:bold; padding:6px 12px; border-radius:20px; margin-bottom:10px;">
-        🌱 Mit Solarstrom betrieben
-    </span>
 
-    <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 12px 16px; border-radius: 8px; margin: 10px auto 0; max-width: 460px; line-height: 1.7;">
-        Unterstütze die Livecam – Server und Kamera laufen mit <strong>Starlink</strong> und <strong>Solarstrom</strong>.<br>
-        Jeder Beitrag hilft, die Betriebskosten zu decken und das Projekt langfristig am Laufen zu halten.
-    </p>
+    <div style="text-align:center; margin-top: 12px;">
+        <span style="display:inline-block; background:#2e7d32; color:white; font-size:12px; font-weight:bold; padding:6px 12px; border-radius:20px; margin-bottom:10px;">
+            🌱 Mit Solarstrom betrieben
+        </span>
+
+        <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 12px 16px; border-radius: 8px; margin: 10px auto 0; max-width: 460px; line-height: 1.7;">
+            Unterstütze die Livecam – Server und Kamera laufen mit <strong>Starlink</strong> und <strong>Solarstrom</strong>.<br>
+            Jeder Beitrag hilft, die Betriebskosten zu decken und das Projekt langfristig am Laufen zu halten.
+        </p>
+    </div>
 </div>
 
 <div class="starlink-banner-wrapper">
