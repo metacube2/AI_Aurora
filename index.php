@@ -3055,14 +3055,17 @@ body.theme-neo footer {
 
 
 
-<div style="text-align: center; margin-bottom: 20px;">
-    <div style="display: flex; justify-content: center;">
-        <a href="https://buymeacoffee.com/auroracam" target="_blank" rel="noopener">
-            <img src="buy.png" alt="Buy me a coffee" style="height: 267px; border-radius: 8px; transition: transform 0.2s;" onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
-        </a>
-    </div>
-    <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 8px 16px; border-radius: 8px; margin: 10px auto 0; max-width: 400px; line-height: 1.6;">
-        Gefällt dir die Livecam? Unterstütze das Projekt –<br>jeder Franken zählt und hilft die Betriebskosten<br>zu decken. So kannst du auch weiterhin<br>Fotos und Videos kostenlos nutzen.
+ 
+  <div class="twint-box">
+    <img src="twint.jpg" alt="TWINT" class="twint-image">
+<div style="text-align:center; margin-top: 12px;">
+    <span style="display:inline-block; background:#2e7d32; color:white; font-size:12px; font-weight:bold; padding:6px 12px; border-radius:20px; margin-bottom:10px;">
+        🌱 Mit Solarstrom betrieben
+    </span>
+
+    <p style="font-size: 14px; color: #333; background: rgba(255,255,255,0.85); padding: 12px 16px; border-radius: 8px; margin: 10px auto 0; max-width: 460px; line-height: 1.7;">
+        Unterstütze die Livecam – Server und Kamera laufen mit <strong>Starlink</strong> und <strong>Solarstrom</strong>.<br>
+        Jeder Beitrag hilft, die Betriebskosten zu decken und das Projekt langfristig am Laufen zu halten.
     </p>
 </div>
 
@@ -3125,9 +3128,7 @@ body.theme-neo footer {
         </p>
 
 
-        <div class="twint-box">
-    <img src="twint.jpg" alt="TWINT" class="twint-image">
-</div>
+      
     </div>
 </section>
 
