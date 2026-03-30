@@ -3156,7 +3156,7 @@ body.theme-neo footer {
 </p>
 
     <span class="green-label-badge">
-        🌱 724 Green Label Swiss
+        🌱 724 Green Label
     </span>
 
     <div class="eco-business-box">
@@ -3189,11 +3189,11 @@ body.theme-neo footer {
 
         <ul class="eco-feature-list">
             <li
-                data-de="724 Green Label Swiss: Zertifizierte Nachhaltigkeit."
-                data-en="724 Green Label Swiss: Certified sustainability."
-                data-fr="724 Green Label Swiss : Durabilité certifiée."
-                data-it="724 Green Label Swiss: Sostenibilità certificata."
-                data-zh="724 Green Label Swiss：认证的可持续发展。">
+                data-de="724 Green Label Swiss: "
+                data-en="724 Green Label Swiss: "
+                data-fr="724 Green Label Swiss: "
+                data-it="724 Green Label Swiss: "
+                data-zh="724 Green Label Swiss：">
                 724 Green Label Swiss: Zertifizierte Nachhaltigkeit.
             </li>
 
